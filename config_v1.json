@@ -1,0 +1,10 @@
+{
+  "network": "testnet",
+  "private_key": "",
+  "to_pubkey": "",
+  "trade_amount_min": 0.02,
+  "trade_amount_max": 0.07,
+  "tx_interval_s": 10,
+  "enable_trading": true,
+  "max_runs": 1
+}

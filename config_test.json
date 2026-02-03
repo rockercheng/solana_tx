@@ -1,0 +1,10 @@
+{
+  "network": "mainnet",
+  "private_key": "3VvcQk9ncrTAJWdjN2oSofF7nBeiyMSUJbbkjLANNKdMXSWC1L7XokjgFqaACu39jHejRYMQAE8VBkVG9jqFoPjL",
+  "to_pubkey": "GnxXnzngEagB4Fx6VTRGCRU2ZkCProEFykNTJxw4CUXB",
+  "trade_amount_min": 0.02,
+  "trade_amount_max": 0.07,
+  "tx_interval_s": 2,
+  "enable_trading": true,
+  "max_runs": 1
+}
