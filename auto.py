@@ -29,6 +29,7 @@ import os
 import sys
 import time
 import traceback
+import hashlib
 from dataclasses import dataclass
 from typing import Optional
 
@@ -41,19 +42,45 @@ from solders.keypair import Keypair
 from solders.transaction import VersionedTransaction
 from solders import message as solders_message
 from solders.pubkey import Pubkey
+from solders.instruction import Instruction, AccountMeta
+from solders.system_program import ID as SYSTEM_PROGRAM_ID
+from solders.message import MessageV0
 
 from solana.rpc.api import Client
 from solana.rpc.types import TokenAccountOpts
+from spl.token.constants import TOKEN_PROGRAM_ID
 
 
+
+# ===== 全局常量 =====
+# 主网 SOL (WSOL) Mint 地址
+SOL_MINT = "So11111111111111111111111111111111111111112"
+# 主网 USDC Mint 地址
+USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 
 # Jupiter Ultra API 基础 URL
-JUPITER_ULTRA_API_BASE = "https://ultra-api.jup.ag"
+# https://portal.jup.ag/api-keys
+# JUPITER_ULTRA_API_BASE = "https://ultra-api.jup.ag"
+JUPITER_ULTRA_API_BASE = "https://api.jup.ag/ultra/v1"
+ULTRA_API_KEY = "72675114-cb71-4b8b-8c21-c429b1082843"
 
-# Ultra API 相关默认参数
-# 注意：具体参数名 / 语义请以 Jupiter Ultra 官方文档为准。
-ULTRA_DEFAULT_SLIPPAGE_PERCENT = 0.03  # 默认滑点 0.03%，配置为“百分比数值”
-ULTRA_DEFAULT_FEE_AMOUNT = 0.000001  # 默认固定平台费金额，例如 0.000001；单位以 Ultra 文档为准
+# Referral 配置 (用于收取集成商费用)
+# referralAccount: 你的推荐账户公钥 (需要先在链上创建)
+# referralFee: 费用基点 (50-255 bps, 例如 50 = 0.5%)
+REFERRAL_ACCOUNT_CONFIG = ""  # 填入你的 referralAccount 公钥，留空则自动创建
+# REFERRAL_FEE = 50  # 费用基点，范围 50-255
+REFERRAL_FEE = 3
+
+# 运行时使用的 referral account (会在程序启动时设置)
+_referral_account: str = ""
+
+# Jupiter Referral Program 配置
+# Jupiter Ultra Referral Project 公钥 (固定值)
+JUPITER_REFERRAL_PROJECT_PUBKEY = "DkiqsTrw1u1bYFumumC7sCG2S8K25qc2vemJFHyW2wJc"
+# Jupiter Referral Program ID
+JUPITER_REFERRAL_PROGRAM_ID = "REFER4ZgmyYx9c6He5XfaTMiGfdLwRnkV4RPp9t9iF3"
+# Referral 账户名称 (用于创建时标识)
+REFERRAL_NAME = "solana_auto_trader"
 
 
 
@@ -80,8 +107,6 @@ class AppConfig:
     tx_interval_s: int
     enable_trading: bool
     max_runs: int
-    ultra_slippage_percent: float  # Ultra 下单使用的滑点百分比，例如 0.03 表示 0.03%
-    ultra_fee_amount: float  # Ultra 下单使用的固定平台费金额
     proxy: Optional[str]  # HTTP 代理地址，如 "http://127.0.0.1:7890"
 
 
@@ -218,16 +243,6 @@ def load_config(path: str) -> AppConfig:
             f"配置项 trade_amount_min={trade_amount_min} 大于 trade_amount_max={trade_amount_max}, 请填写正确的范围。"
         )
 
-    # Ultra 相关配置：如未配置则使用代码中的默认值
-    ultra_slippage_percent = float(
-        raw.get("ultra_slippage_bps", ULTRA_DEFAULT_SLIPPAGE_PERCENT)
-    )
-    ultra_fee_amount = float(raw.get("ultra_fee_amount", ULTRA_DEFAULT_FEE_AMOUNT))
-    if ultra_slippage_percent < 0:
-        raise ValueError("配置项 ultra_slippage_bps 不能为负数。")
-    if ultra_fee_amount < 0:
-        raise ValueError("配置项 ultra_fee_amount 不能为负数。")
-
     cfg = AppConfig(
         network=network,
         rpc_url=rpc_url,
@@ -240,8 +255,6 @@ def load_config(path: str) -> AppConfig:
         tx_interval_s=int(raw.get("tx_interval_s", 60)),
         enable_trading=bool(raw.get("enable_trading", True)),
         max_runs=max_runs,
-        ultra_slippage_percent=ultra_slippage_percent,
-        ultra_fee_amount=ultra_fee_amount,
         proxy=raw.get("proxy") or None,
     )
 
@@ -300,9 +313,9 @@ def _execute_trade_pair_once(
     rpc_url = cfg.rpc_url
     logger.info(f'rpc_url: {rpc_url}')
 
-    # 主网 SOL (WSOL) 与 USDC 的 Mint 地址
-    sol_mint = "So11111111111111111111111111111111111111112"
-    usdc_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+    # 使用全局常量
+    sol_mint = SOL_MINT
+    usdc_mint = USDC_MINT
 
     # 钱包公钥
     wallet_pubkey = str(keypair.pubkey())
@@ -336,10 +349,6 @@ def _execute_trade_pair_once(
     # 设置超时时间
     timeout = 30
 
-    # 根据配置换算 Ultra API 所需的滑点和优先费参数
-    slippage_tolerance = cfg.ultra_slippage_percent / 100.0
-    priority_fee = int(cfg.ultra_fee_amount * 1_000_000_000)
-
     # -------- 第一步: SOL -> USDC --------
     logger.info(
 
@@ -347,22 +356,22 @@ def _execute_trade_pair_once(
         trade_amount_sol_display,
     )
 
-    # 记录第一笔交易前的钱包余额
-    try:
-        sol_before_leg1, usdc_before_leg1 = get_wallet_balances(
-            client, wallet_pubkey, usdc_mint, logger, cfg.rpc_url
-        )
-
-        tx_logger.info(
-            "余额快照 阶段=第一步前 钱包_SOL_lamports=%d 钱包_SOL=%.9f 钱包_USDC_units=%d 钱包_USDC=%.6f",
-            sol_before_leg1,
-            sol_before_leg1 / 1_000_000_000,
-            usdc_before_leg1,
-            usdc_before_leg1 / 1_000_000,
-        )
-
-    except Exception as e:  # noqa: BLE001
-        logger.error("获取第一步前钱包余额失败: %s", e)
+    # 记录第一笔交易前的钱包余额（暂时注释掉，减少 RPC 调用）
+    # try:
+    #     sol_before_leg1, usdc_before_leg1 = get_wallet_balances(
+    #         client, wallet_pubkey, usdc_mint, logger, cfg.rpc_url
+    #     )
+    #
+    #     tx_logger.info(
+    #         "余额快照 阶段=第一步前 钱包_SOL_lamports=%d 钱包_SOL=%.9f 钱包_USDC_units=%d 钱包_USDC=%.6f",
+    #         sol_before_leg1,
+    #         sol_before_leg1 / 1_000_000_000,
+    #         usdc_before_leg1,
+    #         usdc_before_leg1 / 1_000_000,
+    #     )
+    #
+    # except Exception as e:  # noqa: BLE001
+    #     logger.error("获取第一步前钱包余额失败: %s", e)
 
 
     # 调用 Jupiter Ultra API 获取订单（包含报价和交易）
@@ -375,17 +384,15 @@ def _execute_trade_pair_once(
             f"&taker={wallet_pubkey}"
         )
 
-        # 可选：为 Ultra 订单追加滑点和固定 fee 参数
-        # 注意：这里使用的参数名 slippage_tolerance / priority_fee 需与你实际接入的 Ultra 文档保持一致。
-        if cfg.ultra_slippage_percent is not None:
-            order_url += f"&slippageTolerance={slippage_tolerance}"
-        if cfg.ultra_fee_amount is not None and priority_fee > 0:
-            order_url += f"&priorityFee={priority_fee}"
-
+        # 可选：添加 referral 参数以收取集成商费用
+        if _referral_account:
+            order_url += f"&referralAccount={_referral_account}"
+            order_url += f"&referralFee={REFERRAL_FEE}"
 
         logger.debug("请求 SOL->USDC 订单: %s", order_url)
 
-        resp = http_session.get(order_url, timeout=timeout)
+        headers = {"x-api-key": ULTRA_API_KEY}
+        resp = http_session.get(order_url, headers=headers, timeout=timeout)
 
         if resp.status_code != 200:
             logger.error("获取 SOL->USDC 订单失败, HTTP %d: %s", resp.status_code, resp.text)
@@ -473,8 +480,13 @@ def _execute_trade_pair_once(
         # 针对 Failed to decode signed transaction 做一次有限重试
         max_attempts = 2
         last_resp_text = ""
+        # headers = {"x-api-key": ULTRA_API_KEY}
+        headers = {
+            'Content-Type': 'application/json',
+            'x-api-key': ULTRA_API_KEY
+        }
         for attempt in range(1, max_attempts + 1):
-            resp = http_session.post(execute_url, json=execute_payload, timeout=timeout)
+            resp = http_session.post(execute_url, json=execute_payload, headers=headers, timeout=timeout)
 
             if resp.status_code == 200:
                 break
@@ -529,15 +541,12 @@ def _execute_trade_pair_once(
                 "步骤=1 类型=SOL_TO_USDC "
                 "输入代币=SOL 输入数量_solana=%.9f 输入_lamports=%d "
                 "输出代币=USDC 输出数量_usdc=%.6f 输出_units=%d "
-                "滑点容忍度=%.6f 优先费_lamports=%d 签名=%s"
+                "签名=%s"
             ),
-
             trade_amount_sol_display,
             amount_sol_lamports,
             out_usdc_amount / 1_000_000,
             out_usdc_amount,
-            slippage_tolerance,
-            priority_fee,
             sig1,
         )
 
@@ -626,16 +635,15 @@ def _execute_trade_pair_once(
             f"&taker={wallet_pubkey}"
         )
 
-        # 同样为第二步订单追加滑点和固定 fee 参数
-        if cfg.ultra_slippage_percent is not None:
-            order_url2 += f"&slippageTolerance={slippage_tolerance}"
-        if cfg.ultra_fee_amount is not None and priority_fee > 0:
-            order_url2 += f"&priorityFee={priority_fee}"
-
+        # 可选：添加 referral 参数以收取集成商费用
+        if _referral_account:
+            order_url2 += f"&referralAccount={_referral_account}"
+            order_url2 += f"&referralFee={REFERRAL_FEE}"
 
         logger.debug("请求 USDC->SOL 订单: %s", order_url2)
 
-        resp = http_session.get(order_url2, timeout=timeout)
+        headers = {"x-api-key": ULTRA_API_KEY}
+        resp = http_session.get(order_url2, headers=headers, timeout=timeout)
 
         if resp.status_code != 200:
             logger.error("获取 USDC->SOL 订单失败, HTTP %d: %s", resp.status_code, resp.text)
@@ -712,7 +720,12 @@ def _execute_trade_pair_once(
         }
         logger.debug("发送 USDC->SOL 交易到 Ultra API execute...")
 
-        resp = http_session.post(execute_url, json=execute_payload2, timeout=timeout)
+        # headers = {"x-api-key": ULTRA_API_KEY}
+        headers = {
+            'Content-Type': 'application/json',
+            'x-api-key': ULTRA_API_KEY
+        }
+        resp = http_session.post(execute_url, json=execute_payload2, headers=headers, timeout=timeout)
         if resp.status_code != 200:
             logger.error("执行 USDC->SOL 交易失败, HTTP %d: %s", resp.status_code, resp.text)
             error_reason = f"执行 USDC->SOL 交易失败, HTTP {resp.status_code}: {resp.text}"
@@ -735,15 +748,12 @@ def _execute_trade_pair_once(
                 "步骤=2 类型=USDC_TO_SOL "
                 "输入代币=USDC 输入数量_usdc=%.6f 输入_units=%d "
                 "输出代币=SOL 输出数量_solana=%.9f 输出_lamports=%d "
-                "滑点容忍度=%.6f 优先费_lamports=%d 签名=%s"
+                "签名=%s"
             ),
-
             effective_usdc_amount / 1_000_000,
             effective_usdc_amount,
             out_sol_lamports / 1_000_000_000,
             out_sol_lamports,
-            slippage_tolerance,
-            priority_fee,
             sig2,
         )
 
@@ -841,7 +851,8 @@ def get_usdc_balance(
     except Exception as e:  # noqa: BLE001
         # 这一层失败通常是响应结构与当前 solana-py 版本的 typed 定义不完全匹配
         # 下面会自动退回到原始 JSON-RPC 调用, 因此这里仅记录为 WARNING
-        logger.warning("通过 solana-py 获取 USDC 余额失败，将退回原始 JSON-RPC 调用: %s", e)
+        # logger.warning("通过 solana-py 获取 USDC 余额失败，将退回原始 JSON-RPC 调用: %s", e)
+        pass
 
 
         # 如果未显式传入 rpc_url，则尝试从 client 中获取
@@ -891,6 +902,325 @@ def get_usdc_balance(
 
 
 
+
+# ==================== Referral Account 相关函数 ====================
+
+def derive_referral_account_pda(
+    partner_pubkey: Pubkey,
+    project_pubkey: Pubkey,
+) -> tuple[Pubkey, int]:
+    """
+    派生 Referral Account 的 PDA 地址。
+    
+    Seeds: ["referral", project_pubkey, partner_pubkey]
+    """
+    program_id = Pubkey.from_string(JUPITER_REFERRAL_PROGRAM_ID)
+    seeds = [
+        b"referral",
+        bytes(project_pubkey),
+        bytes(partner_pubkey),
+    ]
+    pda, bump = Pubkey.find_program_address(seeds, program_id)
+    return pda, bump
+
+
+def derive_referral_token_account_pda(
+    referral_account_pubkey: Pubkey,
+    mint: Pubkey,
+) -> tuple[Pubkey, int]:
+    """
+    派生 Referral Token Account 的 PDA 地址。
+    
+    Seeds: ["referral_ata", referral_account, mint]
+    """
+    program_id = Pubkey.from_string(JUPITER_REFERRAL_PROGRAM_ID)
+    seeds = [
+        b"referral_ata",
+        bytes(referral_account_pubkey),
+        bytes(mint),
+    ]
+    pda, bump = Pubkey.find_program_address(seeds, program_id)
+    return pda, bump
+
+
+def init_referral_account(
+    client: Client,
+    keypair: Keypair,
+    name: str,
+    logger: logging.Logger,
+) -> Optional[str]:
+    """
+    创建 Referral Account (推荐账户)。
+    
+    只需执行一次。如果账户已存在，则跳过创建。
+    
+    返回: referral_account 公钥字符串，失败返回 None
+    """
+    partner_pubkey = keypair.pubkey()
+    project_pubkey = Pubkey.from_string(JUPITER_REFERRAL_PROJECT_PUBKEY)
+    program_id = Pubkey.from_string(JUPITER_REFERRAL_PROGRAM_ID)
+    
+    # 派生 PDA
+    referral_account_pda, _bump = derive_referral_account_pda(partner_pubkey, project_pubkey)
+    
+    logger.info("Referral Account PDA: %s", str(referral_account_pda))
+    
+    # 检查账户是否已存在
+    try:
+        account_info = client.get_account_info(referral_account_pda)
+        if account_info.value is not None:
+            logger.info("Referral Account 已存在: %s", str(referral_account_pda))
+            return str(referral_account_pda)
+    except Exception as e:
+        logger.debug("检查 Referral Account 时出错: %s", e)
+    
+    # 账户不存在，需要创建
+    logger.info("正在创建 Referral Account: %s", str(referral_account_pda))
+    
+    # 构建 initializeReferralAccountWithName 指令
+    # 指令格式参考 Jupiter Referral SDK
+    # discriminator (8 bytes) + name (string with length prefix)
+    
+    # initializeReferralAccountWithName 的 discriminator
+    # 这是 Anchor 程序的函数签名哈希的前8字节
+    discriminator = hashlib.sha256(b"global:initialize_referral_account_with_name").digest()[:8]
+    
+    # 编码 name 字符串 (Borsh 格式: 4字节长度 + 字符串内容)
+    name_bytes = name.encode('utf-8')
+    name_len = len(name_bytes).to_bytes(4, 'little')
+    
+    instruction_data = discriminator + name_len + name_bytes
+    
+    # 账户列表
+    accounts = [
+        AccountMeta(pubkey=partner_pubkey, is_signer=True, is_writable=True),  # payer
+        AccountMeta(pubkey=partner_pubkey, is_signer=False, is_writable=False),  # partner
+        AccountMeta(pubkey=project_pubkey, is_signer=False, is_writable=False),  # project
+        AccountMeta(pubkey=referral_account_pda, is_signer=False, is_writable=True),  # referral_account
+        AccountMeta(pubkey=SYSTEM_PROGRAM_ID, is_signer=False, is_writable=False),  # system_program
+    ]
+    
+    instruction = Instruction(
+        program_id=program_id,
+        accounts=accounts,
+        data=instruction_data,
+    )
+    
+    # 获取最新 blockhash
+    try:
+        blockhash_resp = client.get_latest_blockhash()
+        recent_blockhash = blockhash_resp.value.blockhash
+    except Exception as e:
+        logger.error("获取 blockhash 失败: %s", e)
+        return None
+    
+    # 构建交易
+    message = MessageV0.try_compile(
+        payer=partner_pubkey,
+        instructions=[instruction],
+        address_lookup_table_accounts=[],
+        recent_blockhash=recent_blockhash,
+    )
+    
+    tx = VersionedTransaction(message, [keypair])
+    
+    # 发送交易
+    try:
+        result = client.send_transaction(tx)
+        signature = str(result.value)
+        logger.info("Referral Account 创建交易已发送: %s", signature)
+        logger.info("Solscan: https://solscan.io/tx/%s", signature)
+        
+        # 等待确认
+        time.sleep(3)
+        logger.info("Referral Account 创建成功: %s", str(referral_account_pda))
+        return str(referral_account_pda)
+        
+    except Exception as e:
+        logger.error("创建 Referral Account 失败: %s", e)
+        logger.debug("异常堆栈:\n%s", traceback.format_exc())
+        return None
+
+
+def init_referral_token_account(
+    client: Client,
+    keypair: Keypair,
+    referral_account_pubkey: str,
+    mint: str,
+    logger: logging.Logger,
+) -> Optional[str]:
+    """
+    创建 Referral Token Account (推荐代币账户)。
+    
+    为指定的 Token Mint 创建代币账户，以便收取该种代币的手续费。
+    需要为每种想要收取费用的代币分别创建。
+    
+    参数:
+        referral_account_pubkey: 上一步创建的 Referral Account 地址
+        mint: 想要收取费用的代币 Mint 地址 (如 SOL_MINT 或 USDC_MINT)
+    
+    返回: referral_token_account 公钥字符串，失败返回 None
+    """
+    payer_pubkey = keypair.pubkey()
+    referral_account = Pubkey.from_string(referral_account_pubkey)
+    mint_pubkey = Pubkey.from_string(mint)
+    program_id = Pubkey.from_string(JUPITER_REFERRAL_PROGRAM_ID)
+    
+    # 派生 Token Account PDA
+    referral_token_account_pda, _bump = derive_referral_token_account_pda(
+        referral_account, mint_pubkey
+    )
+    
+    logger.info("Referral Token Account PDA for %s: %s", mint, str(referral_token_account_pda))
+    
+    # 检查账户是否已存在
+    try:
+        account_info = client.get_account_info(referral_token_account_pda)
+        if account_info.value is not None:
+            logger.info("Referral Token Account 已存在: %s", str(referral_token_account_pda))
+            return str(referral_token_account_pda)
+    except Exception as e:
+        logger.debug("检查 Referral Token Account 时出错: %s", e)
+    
+    # 账户不存在，需要创建
+    logger.info("正在创建 Referral Token Account for %s...", mint)
+    
+    # 构建 initializeReferralTokenAccountV2 指令
+    discriminator = hashlib.sha256(b"global:initialize_referral_token_account_v2").digest()[:8]
+    
+    # 该指令不需要额外数据，只有 discriminator
+    instruction_data = discriminator
+    
+    # 账户列表 (参考 SDK 源码)
+    accounts = [
+        AccountMeta(pubkey=payer_pubkey, is_signer=True, is_writable=True),  # payer
+        AccountMeta(pubkey=referral_account, is_signer=False, is_writable=False),  # referral_account
+        AccountMeta(pubkey=referral_token_account_pda, is_signer=False, is_writable=True),  # referral_token_account
+        AccountMeta(pubkey=mint_pubkey, is_signer=False, is_writable=False),  # mint
+        AccountMeta(pubkey=SYSTEM_PROGRAM_ID, is_signer=False, is_writable=False),  # system_program
+        AccountMeta(pubkey=Pubkey.from_string(str(TOKEN_PROGRAM_ID)), is_signer=False, is_writable=False),  # token_program
+    ]
+    
+    instruction = Instruction(
+        program_id=program_id,
+        accounts=accounts,
+        data=instruction_data,
+    )
+    
+    # 获取最新 blockhash
+    try:
+        blockhash_resp = client.get_latest_blockhash()
+        recent_blockhash = blockhash_resp.value.blockhash
+    except Exception as e:
+        logger.error("获取 blockhash 失败: %s", e)
+        return None
+    
+    # 构建交易
+    message = MessageV0.try_compile(
+        payer=payer_pubkey,
+        instructions=[instruction],
+        address_lookup_table_accounts=[],
+        recent_blockhash=recent_blockhash,
+    )
+    
+    tx = VersionedTransaction(message, [keypair])
+    
+    # 发送交易
+    try:
+        result = client.send_transaction(tx)
+        signature = str(result.value)
+        logger.info("Referral Token Account 创建交易已发送: %s", signature)
+        logger.info("Solscan: https://solscan.io/tx/%s", signature)
+        
+        # 等待确认
+        time.sleep(3)
+        logger.info("Referral Token Account 创建成功: %s", str(referral_token_account_pda))
+        return str(referral_token_account_pda)
+        
+    except Exception as e:
+        logger.error("创建 Referral Token Account 失败: %s", e)
+        logger.debug("异常堆栈:\n%s", traceback.format_exc())
+        return None
+
+
+def setup_referral_accounts(
+    client: Client,
+    keypair: Keypair,
+    logger: logging.Logger,
+) -> Optional[str]:
+    """
+    设置 Referral 账户 (一次性操作)。
+    
+    1. 创建 Referral Account
+    2. 为 SOL 创建 Referral Token Account
+    3. 为 USDC 创建 Referral Token Account
+    
+    返回: referral_account 公钥字符串，失败返回 None
+    """
+    logger.info("===== 开始设置 Referral 账户 =====")
+    
+    # 1. 创建 Referral Account
+    referral_account = init_referral_account(
+        client, keypair, REFERRAL_NAME, logger
+    )
+    
+    if not referral_account:
+        logger.error("创建 Referral Account 失败")
+        return None
+    
+    # 2. 为 SOL 创建 Referral Token Account
+    sol_token_account = init_referral_token_account(
+        client, keypair, referral_account, SOL_MINT, logger
+    )
+    
+    if not sol_token_account:
+        logger.warning("创建 SOL Referral Token Account 失败，继续...")
+    
+    # 3. 为 USDC 创建 Referral Token Account
+    usdc_token_account = init_referral_token_account(
+        client, keypair, referral_account, USDC_MINT, logger
+    )
+    
+    if not usdc_token_account:
+        logger.warning("创建 USDC Referral Token Account 失败，继续...")
+    
+    logger.info("===== Referral 账户设置完成 =====")
+    logger.info("Referral Account: %s", referral_account)
+    logger.info("请将此地址填入 REFERRAL_ACCOUNT_CONFIG 常量中以便下次直接使用")
+    
+    return referral_account
+
+
+def get_or_create_referral_account(
+    client: Client,
+    keypair: Keypair,
+    logger: logging.Logger,
+) -> Optional[str]:
+    """
+    获取或创建 Referral Account。
+    
+    如果 REFERRAL_ACCOUNT_CONFIG 已配置，直接返回。
+    否则自动创建并返回新地址。
+    """
+    if REFERRAL_ACCOUNT_CONFIG:
+        logger.info("使用已配置的 Referral Account: %s", REFERRAL_ACCOUNT_CONFIG)
+        return REFERRAL_ACCOUNT_CONFIG
+    
+    # 检查是否可以派生已存在的账户
+    partner_pubkey = keypair.pubkey()
+    project_pubkey = Pubkey.from_string(JUPITER_REFERRAL_PROJECT_PUBKEY)
+    referral_account_pda, _ = derive_referral_account_pda(partner_pubkey, project_pubkey)
+    
+    try:
+        account_info = client.get_account_info(referral_account_pda)
+        if account_info.value is not None:
+            logger.info("发现已存在的 Referral Account: %s", str(referral_account_pda))
+            return str(referral_account_pda)
+    except Exception:
+        pass
+    
+    logger.info("未找到 Referral Account，将自动创建...")
+    return setup_referral_accounts(client, keypair, logger)
 
 
 
@@ -1041,6 +1371,19 @@ def run_auto_trader() -> None:
         logger.debug("RPC 初始化异常堆栈：\n%s", traceback.format_exc())
         return
 
+    # 3.5 初始化或获取 Referral Account (用于收取集成商费用)
+    global _referral_account
+    if not _referral_account:
+        referral_account = get_or_create_referral_account(client, keypair, logger)
+        if referral_account:
+            _referral_account = referral_account
+            logger.info("Referral Account 已设置: %s", _referral_account)
+        else:
+            logger.error("创建 Referral Account 失败，程序终止。请检查钱包 SOL 余额是否充足（建议至少 0.01 SOL）。")
+            return
+    else:
+        logger.info("使用预配置的 Referral Account: %s", _referral_account)
+
     # 4. 自动交易循环
     logger.info('开始进入自动交易循环，每一轮都会执行"一对交易" (SOL->USDC->SOL)，按 Ctrl + C 可手动停止程序。')
 
@@ -1071,7 +1414,7 @@ def run_auto_trader() -> None:
                     sol_before_pair, usdc_before_pair = get_wallet_balances(
                         client,
                         wallet_pubkey,
-                        "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+                        USDC_MINT,
                         logger,
                         cfg.rpc_url,
                     )
@@ -1141,26 +1484,27 @@ def run_auto_trader() -> None:
             logger.debug("主循环未捕获异常堆栈：\n%s", traceback.format_exc())
             break
 
-        if cfg.enable_trading:
-            try:
-                sol_after_pair, usdc_after_pair = get_wallet_balances(
-                    client,
-                    wallet_pubkey,
-                    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
-                    logger,
-                    cfg.rpc_url,
-                )
-
-                tx_logger.info(
-                    "余额快照 阶段=一对结束 钱包_SOL_lamports=%d 钱包_SOL=%.9f 钱包_USDC_units=%d 钱包_USDC=%.6f",
-                    sol_after_pair,
-                    sol_after_pair / 1_000_000_000,
-                    usdc_after_pair,
-                    usdc_after_pair / 1_000_000,
-                )
-
-            except Exception as e:  # noqa: BLE001
-                logger.error("获取一对交易结束后钱包余额失败: %s", e)
+        # 记录一对交易结束后的钱包余额（暂时注释掉，减少 RPC 调用）
+        # if cfg.enable_trading:
+        #     try:
+        #         sol_after_pair, usdc_after_pair = get_wallet_balances(
+        #             client,
+        #             wallet_pubkey,
+        #             USDC_MINT,
+        #             logger,
+        #             cfg.rpc_url,
+        #         )
+        #
+        #         tx_logger.info(
+        #             "余额快照 阶段=一对结束 钱包_SOL_lamports=%d 钱包_SOL=%.9f 钱包_USDC_units=%d 钱包_USDC=%.6f",
+        #             sol_after_pair,
+        #             sol_after_pair / 1_000_000_000,
+        #             usdc_after_pair,
+        #             usdc_after_pair / 1_000_000,
+        #         )
+        #
+        #     except Exception as e:  # noqa: BLE001
+        #         logger.error("获取一对交易结束后钱包余额失败: %s", e)
 
         if pair_ok:
             success_pairs += 1
