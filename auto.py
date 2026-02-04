@@ -1,31 +1,30 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Solana 自动交易脚本示例。
+Solana 自动交易脚本示例. 
 
 功能特性：
-- 通过配置支持主网 / 测试网（如需 Devnet 可自行配置 rpc_url）
+- 通过配置支持主网 / 测试网(如需 Devnet 可自行配置 rpc_url)
 - 账号、私钥等敏感信息全部通过配置文件加载
-- 详细的调试日志（控制台 + 文件）
+- 详细的调试日志(控制台 + 文件)
 - 独立的交易记录日志
-- 所有错误都输出清晰易懂的日志（包含堆栈方便排查）
+- 所有错误都输出清晰易懂的日志(包含堆栈方便排查)
 
 
-使用说明（简要）：
+使用说明(简要)：
 1. 安装依赖：
    pip install -r requirements.txt
-2. 复制 config_example.json 为 config.json，并按注释填写你的钱包信息
+2. 复制 config_example.json 为 config.json, 并按注释填写你的钱包信息
 3. 运行脚本：
    python auto.py
 
-注意：本脚本仅为演示自动交易框架，不构成任何投资建议。
-在真实主网上使用前，请务必在测试网充分验证、控制金额、了解风险。
+注意：本脚本仅为演示自动交易框架, 不构成任何投资建议. 
+在真实主网上使用前, 请务必在测试网充分验证、控制金额、了解风险. 
 """
 
 from __future__ import annotations
 
 import json
-
 import logging
 import logging.handlers
 import os
@@ -35,25 +34,16 @@ import traceback
 import hashlib
 from dataclasses import dataclass
 from typing import Optional, Callable
-
 import base64
 import base58
 import random
 import requests
-
 from solders.keypair import Keypair
 from solders.transaction import VersionedTransaction, Transaction as LegacyTransaction
 from solders import message as solders_message
 from solders.pubkey import Pubkey
 from solana.rpc.api import Client
 from solana.rpc.types import TokenAccountOpts
-
-# from solders.instruction import Instruction, AccountMeta
-# from solders.system_program import ID as SYSTEM_PROGRAM_ID
-# from solders.message import MessageV0
-# from spl.token.constants import TOKEN_PROGRAM_ID
-
-
 
 # ===== 全局常量 =====
 # 主网 SOL (WSOL) Mint 地址
@@ -67,31 +57,15 @@ USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 JUPITER_ULTRA_API_BASE = "https://api.jup.ag/ultra/v1"
 ULTRA_API_KEY = "72675114-cb71-4b8b-8c21-c429b1082843"
 
-# Jupiter Legacy Swap API 基础 URL（用于优先费 / 滑点可配置的单笔 Swap）
+# Jupiter Legacy Swap API 基础 URL(用于优先费 / 滑点可配置的单笔 Swap)
 # JUPITER_LEGACY_API_BASE = "https://api.jup.ag/swap/v1"
 JUPITER_LEGACY_API_BASE = "https://api.jup.ag/legacy/swap"
 
 
-# 默认 RPC URL 常量，便于集中管理和修改
+# 默认 RPC URL 常量, 便于集中管理和修改
 DEFAULT_MAINNET_RPC_URL = "https://solana-rpc.publicnode.com"
 DEFAULT_TESTNET_RPC_URL = "https://solana-testnet.api.onfinality.io/public"
 
-
-# Referral 配置 (用于收取集成商费用)
-# referralAccount: 你的推荐账户公钥 (需要先在链上创建)
-# referralFee: 费用基点 (50-255 bps, 例如 50 = 0.5%)
-# REFERRAL_ACCOUNT_CONFIG = ""  # 填入你的 referralAccount 公钥，留空则自动创建
-
-# # 运行时使用的 referral account (会在程序启动时设置)
-# _referral_account: str = ""
-
-# Jupiter Referral Program 配置
-# Jupiter Ultra Referral Project 公钥 (固定值)
-# JUPITER_REFERRAL_PROJECT_PUBKEY = "DkiqsTrw1u1bYFumumC7sCG2S8K25qc2vemJFHyW2wJc"
-# Jupiter Referral Program ID
-# JUPITER_REFERRAL_PROGRAM_ID = "REFER4ZgmyYx9c6He5XfaTMiGfdLwRnkV4RPp9t9iF3"
-# Referral 账户名称 (用于创建时标识)
-# REFERRAL_NAME = "solana_auto_trader"
 
 # 可以通过环境变量 SOLANA_AUTO_CONFIG 覆盖配置文件路径
 DEFAULT_CONFIG_PATH = "config.json"
@@ -106,10 +80,9 @@ def legacy_get_swap_transaction(
     amount_lamports: int,
     user_pubkey: str,
 ):
-    """请求 Legacy Swap API，获取包含自定义 priority_fee / slippage 的交易指令。
-
-    使用 config.json 中的 slippage_bps / priority_fee，不影响 Ultra 逻辑。
-    失败时抛出异常，由上层捕获并记录。
+    """请求 Legacy Swap API, 获取包含自定义 priority_fee / slippage 的交易指令. 
+    使用 config.json 中的 slippage_bps / priority_fee, 不影响 Ultra 逻辑. 
+    失败时抛出异常, 由上层捕获并记录. 
     """
 
     headers = {"Content-Type": "application/json"}
@@ -119,7 +92,7 @@ def legacy_get_swap_transaction(
         "amount": amount_lamports,
         "slippageBps": int(getattr(cfg, "slippage_bps", 0)),
         "userPublicKey": user_pubkey,
-        # 文档示例中使用 priorityFee 字段（单位：lamports）
+        # 文档示例中使用 priorityFee 字段(单位：lamports)
         "priorityFee": int(getattr(cfg, "priority_fee", 0)),
     }
 
@@ -154,7 +127,6 @@ def legacy_get_swap_transaction(
         response_hook=_legacy_response_hook,
     )
 
-
     try:
         data = resp.json()
     except Exception as e:  # noqa: BLE001
@@ -164,7 +136,7 @@ def legacy_get_swap_transaction(
     # 提取 Base64 编码的交易指令
     swap_tx_base64 = data.get("swapTransaction")
     if not swap_tx_base64:
-        raise RuntimeError(f"获取交易指令失败，未返回 swapTransaction 字段: {data}")
+        raise RuntimeError(f"获取交易指令失败, 未返回 swapTransaction 字段: {data}")
 
     logger.info(
         "Legacy Swap 报价: inputAmount=%s outputAmount=%s priorityFee=%s",
@@ -175,21 +147,18 @@ def legacy_get_swap_transaction(
     return swap_tx_base64, data
 
 
-
-
 # -------------------------- 3. 解码、签名交易 --------------------------
 def legacy_sign_transaction(swap_tx_base64: str, user_keypair: Keypair, logger: logging.Logger) -> bytes:
-    """解码交易指令，使用用户钱包签名交易，返回签名后的原始字节。
-
-    这里使用 solders.transaction.Transaction + solders.keypair.Keypair 完成签名，
-    避免依赖 solana.transaction / solana.keypair。"""
+    """解码交易指令, 使用用户钱包签名交易, 返回签名后的原始字节. 
+    这里使用 solders.transaction.Transaction + solders.keypair.Keypair 完成签名, 
+    避免依赖 solana.transaction / solana.keypair. """
 
     try:
         tx_data = base64.b64decode(swap_tx_base64)
         transaction = LegacyTransaction.from_bytes(tx_data)
         # solders 的 Transaction.sign 接受 Keypair 列表
         signed_tx = transaction.sign([user_keypair])
-        logger.debug("Legacy 交易签名完成，长度=%d 字节", len(bytes(signed_tx)))
+        logger.debug("Legacy 交易签名完成, 长度=%d 字节", len(bytes(signed_tx)))
         return bytes(signed_tx)
     except Exception as e:  # noqa: BLE001
         logger.error("Legacy 交易签名失败: %s", e)
@@ -197,11 +166,9 @@ def legacy_sign_transaction(swap_tx_base64: str, user_keypair: Keypair, logger: 
         raise
 
 
-
 # -------------------------- 4. 提交交易到 Solana 网络 --------------------------
 def legacy_submit_transaction(client: Client, signed_tx: bytes, logger: logging.Logger) -> str:
-    """提交签名后的交易到 Solana 网络，返回交易签名。"""
-
+    """提交签名后的交易到 Solana 网络, 返回交易签名. """
     try:
         response = client.send_raw_transaction(signed_tx)
         tx_id = str(response.value)
@@ -213,7 +180,6 @@ def legacy_submit_transaction(client: Client, signed_tx: bytes, logger: logging.
         logger.debug("Legacy 提交异常堆栈:\n%s", traceback.format_exc())
         raise
 
-
 # -------------------------- 5. 执行完整 Legacy 交易流程 --------------------------
 def exec_legacy_tx(
     client: Client,
@@ -222,7 +188,7 @@ def exec_legacy_tx(
     logger: logging.Logger,
     tx_logger: logging.Logger,
 ) -> tuple[bool, dict, Optional[str]]:
-    """使用 Jupiter Legacy API 执行一对交易: SOL -> USDC -> SOL。
+    """使用 Jupiter Legacy API 执行一对交易: SOL -> USDC -> SOL. 
 
     - 第 1 步: 使用 Legacy Swap 将随机数量的 SOL 换成 USDC
     - 第 2 步: 使用 Legacy Swap 将当前钱包中全部 USDC 换回 SOL
@@ -241,7 +207,7 @@ def exec_legacy_tx(
     stats = base_empty_stats.copy()
 
     try:
-        # 为本轮 Legacy 一对交易随机选择 SOL 数量（单位：SOL）
+        # 为本轮 Legacy 一对交易随机选择 SOL 数量(单位：SOL)
         trade_amount_sol = random_trade_amount_sol(cfg)
         trade_amount_sol_display = trade_amount_sol
         amount_lamports = int(trade_amount_sol * 1_000_000_000)
@@ -252,11 +218,10 @@ def exec_legacy_tx(
             logger.error(error_reason)
             return False, stats, error_reason
 
-        # 从 Base58 私钥构造 solders-keypair，并得到钱包地址
+        # 从 Base58 私钥构造 solders-keypair, 并得到钱包地址
         secret_stripped = cfg.private_key.strip()
         user_keypair = Keypair.from_base58_string(secret_stripped)
         user_pubkey = str(user_keypair.pubkey())
-
 
         logger.info(
             "开始执行 Legacy 一对交易: 第 1 步 SOL->USDC, 第 2 步 USDC->SOL; amount_sol=%.9f amount_lamports=%d slippage_bps=%s priority_fee=%s",
@@ -305,7 +270,7 @@ def exec_legacy_tx(
 
         logger.info("Legacy 第 1 步获取 SOL->USDC 交易指令成功")
 
-        # 解析报价信息，用于统计 "预计获得" 的 USDC 数量
+        # 解析报价信息, 用于统计 "预计获得" 的 USDC 数量
         try:
             usdc_out_units_est = int(quote1.get("outputAmount", "0"))
         except Exception:  # noqa: BLE001
@@ -345,7 +310,7 @@ def exec_legacy_tx(
             poll_interval_s=2,
         ):
             error_reason = (
-                f"Legacy SOL->USDC 交易 {tx_id1} 在 {confirm_timeout} 秒内未确认或确认失败。"
+                f"Legacy SOL->USDC 交易 {tx_id1} 在 {confirm_timeout} 秒内未确认或确认失败. "
             )
             return False, stats, error_reason
 
@@ -374,7 +339,7 @@ def exec_legacy_tx(
 
         if usdc_after_leg1 <= 0:
             error_reason = (
-                "Legacy 第 1 步后 USDC 余额小于等于 0, 无法执行后续 USDC->SOL 交易。"
+                "Legacy 第 1 步后 USDC 余额小于等于 0, 无法执行后续 USDC->SOL 交易. "
             )
             logger.error(error_reason)
             return False, stats, error_reason
@@ -454,9 +419,7 @@ def exec_legacy_tx(
             timeout_s=confirm_timeout,
             poll_interval_s=2,
         ):
-            error_reason = (
-                f"Legacy USDC->SOL 交易 {tx_id2} 在 {confirm_timeout} 秒内未确认或确认失败。"
-            )
+            error_reason = (f"Legacy USDC->SOL 交易 {tx_id2} 在 {confirm_timeout} 秒内未确认或确认失败. ")
             return False, stats, error_reason
 
         # 一对交易完成后的余额快照
@@ -514,7 +477,6 @@ def exec_legacy_tx(
             net_sol_lamports,
             net_sol,
         )
-
         return True, stats, None
     except Exception as e:  # noqa: BLE001
         error_reason = f"Legacy 一对交易执行失败: {e}"
@@ -523,14 +485,11 @@ def exec_legacy_tx(
         return False, stats, error_reason
 
 
-
-
 @dataclass
 class AppConfig:
-    """应用配置对象，便于在代码中类型提示和访问字段。"""
+    """应用配置对象, 便于在代码中类型提示和访问字段. """
 
     network: str  # mainnet / testnet
-
     rpc_url: str
     private_key: str  # Base58 编码的私钥字符串
     from_pubkey: Optional[str]
@@ -541,22 +500,15 @@ class AppConfig:
     tx_interval_s: int
     enable_trading: bool
     max_runs: int
-    # referral_fee: int  # Referral 费用基点（如生效，需在 50-255 范围内）
-    # enable_referral: bool  # 是否启用 Referral 功能（包括使用 referral_fee 以及创建/获取 referral 账户）
     retry_max_attempts: int  # 外部 HTTP/RPC 调用的最大重试次数
     retry_sleep_s: int  # 外部 HTTP/RPC 重试间隔秒数
-    slippage_bps: int  # Legacy Swap 使用的滑点（单位：bps）
-    priority_fee: int  # Legacy Swap 使用的优先费（单位：lamports）
+    slippage_bps: int  # Legacy Swap 使用的滑点(单位：bps)
+    priority_fee: int  # Legacy Swap 使用的优先费(单位：lamports)
     support_prio_fee: bool  # 是否启用 Legacy 单笔 Swap 模式
 
 
-
-
-
-
 def setup_logging(log_dir: str = "logs") -> tuple[logging.Logger, logging.Logger]:
-    """初始化日志系统。
-
+    """初始化日志系统. 
     - 主日志 logger：打印到控制台 + 写入 logs/app.log
     - 交易日志 tx_logger：专门写入 logs/transactions.log
     """
@@ -568,17 +520,15 @@ def setup_logging(log_dir: str = "logs") -> tuple[logging.Logger, logging.Logger
     logger.setLevel(logging.DEBUG)
     logger.handlers.clear()
 
-    log_format = logging.Formatter(
-        "[%(asctime)s] [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
-    )
+    log_format = logging.Formatter("[%(asctime)s] [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 
-    # 控制台日志（DEBUG 级别）
+    # 控制台日志(DEBUG 级别)
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(logging.DEBUG)
     console_handler.setFormatter(log_format)
     logger.addHandler(console_handler)
 
-    # 文件日志（包含 DEBUG 级别）
+    # 文件日志(包含 DEBUG 级别)
     file_handler = logging.handlers.RotatingFileHandler(
         os.path.join(log_dir, "app.log"),
         maxBytes=5 * 1024 * 1024,  # 5 MB
@@ -607,12 +557,10 @@ def setup_logging(log_dir: str = "logs") -> tuple[logging.Logger, logging.Logger
 
 
 def load_config(path: str) -> AppConfig:
-    """从 JSON 文件加载配置，并做基本校验和默认值处理。"""
+    """从 JSON 文件加载配置, 并做基本校验和默认值处理. """
 
     if not os.path.exists(path):
-        raise FileNotFoundError(
-            f"配置文件不存在：{path}，请先复制 config_example.json 为 {path} 并按说明填写。"
-        )
+        raise FileNotFoundError(f"配置文件不存在：{path}, 请先复制 config_example.json 为 {path} 并按说明填写. ")
 
     with open(path, "r", encoding="utf-8") as f:
         raw = json.load(f)
@@ -620,7 +568,7 @@ def load_config(path: str) -> AppConfig:
     # 网络类型
     network = raw.get("network", "testnet").lower()
 
-    # RPC URL：可以显式配置，也可以根据 network 自动选择
+    # RPC URL：可以显式配置, 也可以根据 network 自动选择
     rpc_url = raw.get("rpc_url")
     if not rpc_url:
         if network == "mainnet":
@@ -628,29 +576,27 @@ def load_config(path: str) -> AppConfig:
         elif network == "testnet":
             rpc_url = DEFAULT_TESTNET_RPC_URL
         else:
-            raise ValueError(
-                f"未知 network 类型：{network}，请使用 mainnet / testnet 之一。"
-            )
+            raise ValueError(f"未知 network 类型：{network}, 请使用 mainnet / testnet 之一. ")
 
 
     # 必填字段简单校验
     if "private_key" not in raw:
-        raise ValueError("配置文件中缺少 private_key 字段（Base58 编码的私钥字符串）。")
+        raise ValueError("配置文件中缺少 private_key 字段(Base58 编码的私钥字符串). ")
 
     if "to_pubkey" not in raw:
-        raise ValueError("配置文件中缺少 to_pubkey 字段（交易接收方地址）。")
+        raise ValueError("配置文件中缺少 to_pubkey 字段(交易接收方地址). ")
 
     if "max_runs" not in raw:
-        raise ValueError("配置文件中缺少 max_runs 字段 (必须是大于 0 的整数)。")
+        raise ValueError("配置文件中缺少 max_runs 字段 (必须是大于 0 的整数). ")
 
     try:
         max_runs_int = int(raw["max_runs"])
     except (TypeError, ValueError) as exc:
-        raise ValueError("配置项 max_runs 必须是正整数 (大于 0)。") from exc
+        raise ValueError("配置项 max_runs 必须是正整数 (大于 0). ") from exc
 
     if max_runs_int <= 0:
         raise ValueError(
-            f"配置项 max_runs 的值无效: {max_runs_int}。请填写大于 0 的整数。"
+            f"配置项 max_runs 的值无效: {max_runs_int}. 请填写大于 0 的整数. "
         )
 
     max_runs = max_runs_int
@@ -658,9 +604,8 @@ def load_config(path: str) -> AppConfig:
     trade_mode_raw = "SOL_TO_USDC"
 
     if "trade_amount_min" not in raw or "trade_amount_max" not in raw:
-
         raise ValueError(
-            "配置文件中缺少 trade_amount_min 或 trade_amount_max 字段 (必须是大于 0 的数字)。"
+            "配置文件中缺少 trade_amount_min 或 trade_amount_max 字段 (必须是大于 0 的数字). "
         )
 
     try:
@@ -668,34 +613,27 @@ def load_config(path: str) -> AppConfig:
         trade_amount_max = float(raw["trade_amount_max"])
     except (TypeError, ValueError) as exc:
         raise ValueError(
-            "配置项 trade_amount_min / trade_amount_max 必须是数字类型, 且大于 0。"
+            "配置项 trade_amount_min / trade_amount_max 必须是数字类型, 且大于 0. "
         ) from exc
 
     if trade_amount_min <= 0 or trade_amount_max <= 0:
-        raise ValueError("配置项 trade_amount_min / trade_amount_max 必须大于 0。")
+        raise ValueError("配置项 trade_amount_min / trade_amount_max 必须大于 0. ")
 
     if trade_amount_min > trade_amount_max:
         raise ValueError(
-            f"配置项 trade_amount_min={trade_amount_min} 大于 trade_amount_max={trade_amount_max}, 请填写正确的范围。"
+            f"配置项 trade_amount_min={trade_amount_min} 大于 trade_amount_max={trade_amount_max}, 请填写正确的范围. "
         )
-
-    # # Referral 费用基点，默认 3
-    # referral_fee = int(raw.get("referral_fee", 3))
-
-    # # 是否启用 Referral 功能（包括使用 referral_fee 以及创建/获取 referral 账户）
-    # enable_referral = bool(raw.get("enable_referral", False))
 
     # 外部 HTTP/RPC 调用的重试策略
     retry_max_attempts = int(raw.get("retry_max_attempts", 10))
     retry_sleep_s = int(raw.get("retry_sleep_s", 2))
 
-    # Legacy Swap 相关配置（用于 priority_fee / slippage）
+    # Legacy Swap 相关配置(用于 priority_fee / slippage)
     slippage_bps = int(raw.get("slippage_bps", 0))
     priority_fee = int(raw.get("priority_fee", 0))
     support_prio_fee = bool(raw.get("support_prio_fee", False))
 
     cfg = AppConfig(
-
         network=network,
         rpc_url=rpc_url,
         private_key=str(raw["private_key"]),
@@ -707,23 +645,17 @@ def load_config(path: str) -> AppConfig:
         tx_interval_s=int(raw.get("tx_interval_s", 60)),
         enable_trading=bool(raw.get("enable_trading", True)),
         max_runs=max_runs,
-        # referral_fee=referral_fee,
-        # enable_referral=enable_referral,
         retry_max_attempts=retry_max_attempts,
         retry_sleep_s=retry_sleep_s,
         slippage_bps=slippage_bps,
         priority_fee=priority_fee,
         support_prio_fee=support_prio_fee,
     )
-
-
-
     return cfg
 
 
-
 def random_trade_amount_sol(cfg: AppConfig) -> float:
-    """在 trade_amount_min / trade_amount_max 范围内随机选择本次交易的 SOL 数量（单位：SOL）。"""
+    """在 trade_amount_min / trade_amount_max 范围内随机选择本次交易的 SOL 数量(单位：SOL). """
     trade_amount_sol_raw = random.uniform(cfg.trade_amount_min, cfg.trade_amount_max)
     trade_amount_sol = round(trade_amount_sol_raw, 3)
     return trade_amount_sol
@@ -736,15 +668,14 @@ def _execute_trade_pair_once(
     logger: logging.Logger,
     tx_logger: logging.Logger,
 ) -> tuple[bool, dict, Optional[str]]:
-
-    """执行"一对交易": SOL -> USDC -> SOL。
+    """执行"一对交易": SOL -> USDC -> SOL. 
 
     步骤:
     1. 使用配置中的 trade_amount (SOL 数量) 将 SOL 换成 USDC;
-    2. 使用步骤 1 得到的 USDC 金额再换回 SOL。
+    2. 使用步骤 1 得到的 USDC 金额再换回 SOL. 
 
-    任一步骤失败, 都会立即终止本次"一对交易", 并返回 (False, stats)。
-    全部成功时返回 (True, stats)。
+    任一步骤失败, 都会立即终止本次"一对交易", 并返回 (False, stats). 
+    全部成功时返回 (True, stats). 
 
     stats 字段包括:
     - sol_spent_lamports: 本次一对交易开始时花费的 SOL (lamports)
@@ -764,14 +695,13 @@ def _execute_trade_pair_once(
 
     if cfg.network != "mainnet":
         logger.error(
-            "当前网络配置为 %s, 仅支持在 mainnet 上执行 SOL/USDC 互换。",
+            "当前网络配置为 %s, 仅支持在 mainnet 上执行 SOL/USDC 互换. ",
             cfg.network,
         )
         error_reason = (
-            f"当前网络配置为 {cfg.network}, 仅支持在 mainnet 上执行 SOL/USDC 互换。"
+            f"当前网络配置为 {cfg.network}, 仅支持在 mainnet 上执行 SOL/USDC 互换. "
         )
         return False, base_empty_stats.copy(), error_reason
-
 
     # 默认 mainnet RPC, 如 cfg.rpc_url 为空则使用官方 RPC
     rpc_url = cfg.rpc_url
@@ -784,33 +714,31 @@ def _execute_trade_pair_once(
     # 钱包公钥
     wallet_pubkey = str(keypair.pubkey())
 
-    # 为本次一对交易随机生成 SOL 卖出数量（单位：SOL），只保留 3 位小数
+    # 为本次一对交易随机生成 SOL 卖出数量(单位：SOL), 只保留 3 位小数
     trade_amount_sol = random_trade_amount_sol(cfg)
     # 日志展示同样保留 3 位小数
     trade_amount_sol_display = trade_amount_sol
-
 
     amount_sol_lamports = int(trade_amount_sol * 1_000_000_000)
 
     if amount_sol_lamports <= 0:
         logger.error(
             "根据 trade_amount 范围 [%.9f, %.9f] 随机得到的本次 SOL 数量=%.9f, "
-            "换算为最小单位数量=%d, 必须大于 0。",
+            "换算为最小单位数量=%d, 必须大于 0. ",
             cfg.trade_amount_min,
             cfg.trade_amount_max,
             trade_amount_sol_display,
             amount_sol_lamports,
         )
         error_reason = (
-            "根据 trade_amount 范围随机得到的本次 SOL 数量换算为最小单位后无效 (<= 0)。"
+            "根据 trade_amount 范围随机得到的本次 SOL 数量换算为最小单位后无效 (<= 0). "
         )
         return False, base_empty_stats.copy(), error_reason
 
-
-    # 本次一对交易内的统计数据（仅在两步都成功时才会被累计到总统计中）
+    # 本次一对交易内的统计数据(仅在两步都成功时才会被累计到总统计中)
     stats = base_empty_stats.copy()
 
-    # 创建 requests Session，会自动使用系统代理
+    # 创建 requests Session, 会自动使用系统代理
     http_session = requests.Session()
     # 设置超时时间
     timeout = 30
@@ -830,6 +758,7 @@ def _execute_trade_pair_once(
         trade_amount_sol_display,
         amount_sol_lamports,
     )
+
     if not first_ok:
         return False, stats, error_reason
 
@@ -863,10 +792,10 @@ def _execute_trade_pair_once(
     return True, stats, None
 
 def load_keypair_from_base58(secret: str) -> Keypair:
-    """从 Base58 编码的私钥字符串创建 Keypair。
+    """从 Base58 编码的私钥字符串创建 Keypair. 
 
-    很多钱包（如 Phantom）导出的私钥是 Base58 字符串，而不是 64 个数字数组。
-    这里统一使用 Base58，便于配置和复制粘贴。
+    很多钱包(如 Phantom)导出的私钥是 Base58 字符串, 而不是 64 个数字数组. 
+    这里统一使用 Base58, 便于配置和复制粘贴. 
     """
 
     try:
@@ -874,14 +803,12 @@ def load_keypair_from_base58(secret: str) -> Keypair:
         return Keypair.from_base58_string(secret_stripped)
     except Exception as e:  # noqa: BLE001 - 需要捕获所有错误并给出清晰提示
         raise ValueError(
-            "私钥格式错误：请确认是 Base58 编码的 Solana 私钥字符串，且不要包含多余空格或换行。"
+            "私钥格式错误：请确认是 Base58 编码的 Solana 私钥字符串, 且不要包含多余空格或换行. "
         ) from e
 
 def build_client(cfg: AppConfig) -> Client:
-    """根据配置创建 Solana RPC 客户端。"""
-
+    """根据配置创建 Solana RPC 客户端. """
     return Client(cfg.rpc_url)
-
 
 def get_usdc_balance(
     client: Client,
@@ -893,15 +820,14 @@ def get_usdc_balance(
     retry_sleep_s: int = 2,
 ) -> int:
 
-    """查询指定钱包当前的 USDC 余额（最小单位）。
-
-    优先通过 solana-py 的 typed 响应获取，如果解析失败，则退回到原始 JSON-RPC 调用。
+    """查询指定钱包当前的 USDC 余额(最小单位). 
+    优先通过 solana-py 的 typed 响应获取, 如果解析失败, 则退回到原始 JSON-RPC 调用. 
     """
 
     owner_pk = Pubkey.from_string(owner_pubkey)
     mint_pk = Pubkey.from_string(usdc_mint)
 
-    # 使用 TokenAccountOpts，以兼容当前 solana-py 版本
+    # 使用 TokenAccountOpts, 以兼容当前 solana-py 版本
     opts = TokenAccountOpts(mint=mint_pk, encoding="jsonParsed")
 
     try:
@@ -916,12 +842,9 @@ def get_usdc_balance(
     except Exception as e:  # noqa: BLE001
         # 这一层失败通常是响应结构与当前 solana-py 版本的 typed 定义不完全匹配
         # 下面会自动退回到原始 JSON-RPC 调用, 因此这里仅记录为 WARNING
-        logger.warning(
-            "通过 solana-py 获取 USDC 余额失败，将退回原始 JSON-RPC 调用: %s",
-            e,
-        )
+        logger.warning("通过 solana-py 获取 USDC 余额失败, 将退回原始 JSON-RPC 调用: %s", e)
 
-        # 如果未显式传入 rpc_url，则尝试从 client 中获取
+        # 如果未显式传入 rpc_url, 则尝试从 client 中获取
         if rpc_url is None:
             try:
                 rpc_url = getattr(getattr(client, "_provider", None), "endpoint_uri", None)
@@ -929,10 +852,10 @@ def get_usdc_balance(
                 rpc_url = None
 
         if not rpc_url:
-            # 无法获得 RPC 地址，只能把异常抛出去
+            # 无法获得 RPC 地址, 只能把异常抛出去
             raise
 
-        # 退回到直接使用 JSON-RPC 请求，并增加重试机制（使用通用 HTTP 重试封装）
+        # 退回到直接使用 JSON-RPC 请求, 并增加重试机制(使用通用 HTTP 重试封装)
         payload = {
             "jsonrpc": "2.0",
             "id": 1,
@@ -958,353 +881,17 @@ def get_usdc_balance(
             sleep_s=retry_sleep_s,
         )
         data = http_resp.json()
-
         result = data.get("result", {})
         value = result.get("value", [])
-
-
-
 
     total = 0
     for item in value:
         try:
-            amount_str = (
-                item["account"]["data"]["parsed"]["info"]["tokenAmount"]["amount"]
-            )
+            amount_str = (item["account"]["data"]["parsed"]["info"]["tokenAmount"]["amount"])
             total += int(amount_str)
         except Exception:  # noqa: BLE001
             logger.debug("解析 USDC 余额时跳过异常账户: %s", item)
-
     return total
-
-
-
-
-# ==================== Referral Account 相关函数 ====================
-
-# def derive_referral_account_pda(
-#     partner_pubkey: Pubkey,
-#     project_pubkey: Pubkey,
-# ) -> tuple[Pubkey, int]:
-#     """
-#     派生 Referral Account 的 PDA 地址。
-    
-#     Seeds: ["referral", project_pubkey, partner_pubkey]
-#     """
-#     program_id = Pubkey.from_string(JUPITER_REFERRAL_PROGRAM_ID)
-#     seeds = [
-#         b"referral",
-#         bytes(project_pubkey),
-#         bytes(partner_pubkey),
-#     ]
-#     pda, bump = Pubkey.find_program_address(seeds, program_id)
-#     return pda, bump
-
-
-# def derive_referral_token_account_pda(
-#     referral_account_pubkey: Pubkey,
-#     mint: Pubkey,
-# ) -> tuple[Pubkey, int]:
-#     """
-#     派生 Referral Token Account 的 PDA 地址。
-    
-#     Seeds: ["referral_ata", referral_account, mint]
-#     """
-#     program_id = Pubkey.from_string(JUPITER_REFERRAL_PROGRAM_ID)
-#     seeds = [
-#         b"referral_ata",
-#         bytes(referral_account_pubkey),
-#         bytes(mint),
-#     ]
-#     pda, bump = Pubkey.find_program_address(seeds, program_id)
-#     return pda, bump
-
-
-# def init_referral_account(
-#     client: Client,
-#     keypair: Keypair,
-#     name: str,
-#     logger: logging.Logger,
-# ) -> Optional[str]:
-#     """
-#     创建 Referral Account (推荐账户)。
-    
-#     只需执行一次。如果账户已存在，则跳过创建。
-    
-#     返回: referral_account 公钥字符串，失败返回 None
-#     """
-#     partner_pubkey = keypair.pubkey()
-#     project_pubkey = Pubkey.from_string(JUPITER_REFERRAL_PROJECT_PUBKEY)
-#     program_id = Pubkey.from_string(JUPITER_REFERRAL_PROGRAM_ID)
-    
-#     # 派生 PDA
-#     referral_account_pda, _bump = derive_referral_account_pda(partner_pubkey, project_pubkey)
-    
-#     logger.info("Referral Account PDA: %s", str(referral_account_pda))
-    
-#     # 检查账户是否已存在
-#     try:
-#         account_info = client.get_account_info(referral_account_pda)
-#         if account_info.value is not None:
-#             logger.info("Referral Account 已存在: %s", str(referral_account_pda))
-#             return str(referral_account_pda)
-#     except Exception as e:
-#         logger.debug("检查 Referral Account 时出错: %s", e)
-    
-#     # 账户不存在，需要创建
-#     logger.info("正在创建 Referral Account: %s", str(referral_account_pda))
-    
-#     # 构建 initializeReferralAccountWithName 指令
-#     # 指令格式参考 Jupiter Referral SDK
-#     # discriminator (8 bytes) + name (string with length prefix)
-    
-#     # initializeReferralAccountWithName 的 discriminator
-#     # 这是 Anchor 程序的函数签名哈希的前8字节
-#     discriminator = hashlib.sha256(b"global:initialize_referral_account_with_name").digest()[:8]
-    
-#     # 编码 name 字符串 (Borsh 格式: 4字节长度 + 字符串内容)
-#     name_bytes = name.encode('utf-8')
-#     name_len = len(name_bytes).to_bytes(4, 'little')
-    
-#     instruction_data = discriminator + name_len + name_bytes
-    
-#     # 账户列表
-#     accounts = [
-#         AccountMeta(pubkey=partner_pubkey, is_signer=True, is_writable=True),  # payer
-#         AccountMeta(pubkey=partner_pubkey, is_signer=False, is_writable=False),  # partner
-#         AccountMeta(pubkey=project_pubkey, is_signer=False, is_writable=False),  # project
-#         AccountMeta(pubkey=referral_account_pda, is_signer=False, is_writable=True),  # referral_account
-#         AccountMeta(pubkey=SYSTEM_PROGRAM_ID, is_signer=False, is_writable=False),  # system_program
-#     ]
-    
-#     instruction = Instruction(
-#         program_id=program_id,
-#         accounts=accounts,
-#         data=instruction_data,
-#     )
-    
-#     # 获取最新 blockhash
-#     try:
-#         blockhash_resp = client.get_latest_blockhash()
-#         recent_blockhash = blockhash_resp.value.blockhash
-#     except Exception as e:
-#         logger.error("获取 blockhash 失败: %s", e)
-#         return None
-    
-#     # 构建交易
-#     message = MessageV0.try_compile(
-#         payer=partner_pubkey,
-#         instructions=[instruction],
-#         address_lookup_table_accounts=[],
-#         recent_blockhash=recent_blockhash,
-#     )
-    
-#     tx = VersionedTransaction(message, [keypair])
-    
-#     # 发送交易
-#     try:
-#         result = client.send_transaction(tx)
-#         signature = str(result.value)
-#         logger.info("Referral Account 创建交易已发送: %s", signature)
-#         logger.info("Solscan: https://solscan.io/tx/%s", signature)
-        
-#         # 等待确认
-#         time.sleep(10)
-#         logger.info("Referral Account 创建成功: %s", str(referral_account_pda))
-#         return str(referral_account_pda)
-        
-#     except Exception as e:
-#         logger.error("创建 Referral Account 失败: %s", e)
-#         logger.debug("异常堆栈:\n%s", traceback.format_exc())
-#         return None
-
-
-# def init_referral_token_account(
-#     client: Client,
-#     keypair: Keypair,
-#     referral_account_pubkey: str,
-#     mint: str,
-#     logger: logging.Logger,
-# ) -> Optional[str]:
-#     """
-#     创建 Referral Token Account (推荐代币账户)。
-    
-#     为指定的 Token Mint 创建代币账户，以便收取该种代币的手续费。
-#     需要为每种想要收取费用的代币分别创建。
-    
-#     参数:
-#         referral_account_pubkey: 上一步创建的 Referral Account 地址
-#         mint: 想要收取费用的代币 Mint 地址 (如 SOL_MINT 或 USDC_MINT)
-    
-#     返回: referral_token_account 公钥字符串，失败返回 None
-#     """
-#     payer_pubkey = keypair.pubkey()
-#     referral_account = Pubkey.from_string(referral_account_pubkey)
-#     mint_pubkey = Pubkey.from_string(mint)
-#     program_id = Pubkey.from_string(JUPITER_REFERRAL_PROGRAM_ID)
-    
-#     # 派生 Token Account PDA
-#     referral_token_account_pda, _bump = derive_referral_token_account_pda(
-#         referral_account, mint_pubkey
-#     )
-    
-#     logger.info("Referral Token Account PDA for %s: %s", mint, str(referral_token_account_pda))
-    
-#     # 检查账户是否已存在
-#     try:
-#         account_info = client.get_account_info(referral_token_account_pda)
-#         if account_info.value is not None:
-#             logger.info("Referral Token Account 已存在: %s", str(referral_token_account_pda))
-#             return str(referral_token_account_pda)
-#     except Exception as e:
-#         logger.debug("检查 Referral Token Account 时出错: %s", e)
-    
-#     # 账户不存在，需要创建
-#     logger.info("正在创建 Referral Token Account for %s...", mint)
-    
-#     # 构建 initializeReferralTokenAccountV2 指令
-#     discriminator = hashlib.sha256(b"global:initialize_referral_token_account_v2").digest()[:8]
-    
-#     # 该指令不需要额外数据，只有 discriminator
-#     instruction_data = discriminator
-    
-#     # 账户列表 (参考 SDK 源码)
-#     accounts = [
-#         AccountMeta(pubkey=payer_pubkey, is_signer=True, is_writable=True),  # payer
-#         AccountMeta(pubkey=referral_account, is_signer=False, is_writable=False),  # referral_account
-#         AccountMeta(pubkey=referral_token_account_pda, is_signer=False, is_writable=True),  # referral_token_account
-#         AccountMeta(pubkey=mint_pubkey, is_signer=False, is_writable=False),  # mint
-#         AccountMeta(pubkey=SYSTEM_PROGRAM_ID, is_signer=False, is_writable=False),  # system_program
-#         AccountMeta(pubkey=Pubkey.from_string(str(TOKEN_PROGRAM_ID)), is_signer=False, is_writable=False),  # token_program
-#     ]
-    
-#     instruction = Instruction(
-#         program_id=program_id,
-#         accounts=accounts,
-#         data=instruction_data,
-#     )
-    
-#     # 获取最新 blockhash
-#     try:
-#         blockhash_resp = client.get_latest_blockhash()
-#         recent_blockhash = blockhash_resp.value.blockhash
-#     except Exception as e:
-#         logger.error("获取 blockhash 失败: %s", e)
-#         return None
-    
-#     # 构建交易
-#     message = MessageV0.try_compile(
-#         payer=payer_pubkey,
-#         instructions=[instruction],
-#         address_lookup_table_accounts=[],
-#         recent_blockhash=recent_blockhash,
-#     )
-    
-#     tx = VersionedTransaction(message, [keypair])
-    
-#     # 发送交易
-#     try:
-#         result = client.send_transaction(tx)
-#         signature = str(result.value)
-#         logger.info("Referral Token Account 创建交易已发送: %s", signature)
-#         logger.info("Solscan: https://solscan.io/tx/%s", signature)
-        
-#         # 等待确认
-#         time.sleep(10)
-#         logger.info("Referral Token Account 创建成功: %s", str(referral_token_account_pda))
-#         return str(referral_token_account_pda)
-        
-#     except Exception as e:
-#         logger.error("创建 Referral Token Account 失败: %s", e)
-#         logger.debug("异常堆栈:\n%s", traceback.format_exc())
-#         return None
-
-
-# def setup_referral_accounts(
-#     client: Client,
-#     keypair: Keypair,
-#     logger: logging.Logger,
-# ) -> Optional[str]:
-#     """
-#     设置 Referral 账户 (一次性操作)。
-    
-#     1. 创建 Referral Account
-#     2. 为 SOL 创建 Referral Token Account
-#     3. 为 USDC 创建 Referral Token Account
-    
-#     返回: referral_account 公钥字符串，失败返回 None
-#     """
-#     logger.info("===== 开始设置 Referral 账户 =====")
-    
-#     # 1. 创建 Referral Account
-#     referral_account = init_referral_account(
-#         client, keypair, REFERRAL_NAME, logger
-#     )
-    
-#     if not referral_account:
-#         logger.error("创建 Referral Account 失败")
-#         return None
-    
-#     # 2. 为 SOL 创建 Referral Token Account
-#     sol_token_account = init_referral_token_account(
-#         client, keypair, referral_account, SOL_MINT, logger
-#     )
-    
-#     if not sol_token_account:
-#         logger.warning("创建 SOL Referral Token Account 失败，继续...")
-    
-#     # 3. 为 USDC 创建 Referral Token Account
-#     usdc_token_account = init_referral_token_account(
-#         client, keypair, referral_account, USDC_MINT, logger
-#     )
-    
-#     if not usdc_token_account:
-#         logger.warning("创建 USDC Referral Token Account 失败，继续...")
-    
-#     logger.info("===== Referral 账户设置完成 =====")
-#     logger.info("Referral Account: %s", referral_account)
-#     logger.info("请将此地址填入 REFERRAL_ACCOUNT_CONFIG 常量中以便下次直接使用")
-    
-#     return referral_account
-
-
-# def get_or_create_referral_account(
-#     client: Client,
-#     keypair: Keypair,
-#     logger: logging.Logger,
-# ) -> Optional[str]:
-#     """
-#     获取或创建 Referral Account。
-    
-#     如果 REFERRAL_ACCOUNT_CONFIG 已配置，直接返回。
-#     否则自动创建并返回新地址。
-#     """
-#     if REFERRAL_ACCOUNT_CONFIG:
-#         logger.info("使用已配置的 Referral Account: %s", REFERRAL_ACCOUNT_CONFIG)
-#         return REFERRAL_ACCOUNT_CONFIG
-
-#     # 检查是否可以派生已存在的账户
-#     partner_pubkey = keypair.pubkey()
-#     project_pubkey = Pubkey.from_string(JUPITER_REFERRAL_PROJECT_PUBKEY)
-#     referral_account_pda, _ = derive_referral_account_pda(partner_pubkey, project_pubkey)
-    
-#     logger.info("检查 Referral Account PDA: %s", str(referral_account_pda))
-    
-#     try:
-#         account_info = client.get_account_info(referral_account_pda)
-#         logger.debug("get_account_info 响应: %s", account_info)
-#         if account_info.value is not None:
-#             logger.info("发现已存在的 Referral Account: %s", str(referral_account_pda))
-#             return str(referral_account_pda)
-#         else:
-#             logger.info("链上查询结果: 账户不存在 (value is None)")
-#     except Exception as e:
-#         logger.warning("查询 Referral Account 时出错: %s", e)
-#         logger.debug("查询异常堆栈:\n%s", traceback.format_exc())
-    
-#     logger.info("未找到 Referral Account，将自动创建...")
-#     return setup_referral_accounts(client, keypair, logger)
-
 
 
 def get_wallet_balances(
@@ -1317,14 +904,13 @@ def get_wallet_balances(
     retry_sleep_s: int = 2,
 ) -> tuple[int, int]:
 
-    """查询指定钱包当前的 SOL / USDC 余额。
-
-    返回 (sol_lamports, usdc_units)。
+    """查询指定钱包当前的 SOL / USDC 余额. 
+    返回 (sol_lamports, usdc_units). 
     """
 
     owner_pk = Pubkey.from_string(owner_pubkey)
 
-    # 先通过 solana-py 获取 SOL 余额，如果解析失败则退回到原始 JSON-RPC 调用
+    # 先通过 solana-py 获取 SOL 余额, 如果解析失败则退回到原始 JSON-RPC 调用
     try:
         resp_sol = client.get_balance(owner_pk)
 
@@ -1336,7 +922,7 @@ def get_wallet_balances(
     except Exception as e:  # noqa: BLE001
         # 这一层失败通常是响应结构与当前 solana-py 版本的 typed 定义不完全匹配
         # 下面会自动退回到原始 JSON-RPC 调用, 因此这里仅记录为 WARNING
-        logger.warning("通过 solana-py 获取 SOL 余额失败，将退回原始 JSON-RPC 调用: %s", e)
+        logger.warning("通过 solana-py 获取 SOL 余额失败, 将退回原始 JSON-RPC 调用: %s", e)
 
         if rpc_url is None:
             try:
@@ -1345,10 +931,10 @@ def get_wallet_balances(
                 rpc_url = None
 
         if not rpc_url:
-            # 无法获得 RPC 地址，只能把异常抛出去
+            # 无法获得 RPC 地址, 只能把异常抛出去
             raise
 
-        # 使用原始 JSON-RPC 调用作为兜底，并增加重试机制（使用通用 HTTP 重试封装）
+        # 使用原始 JSON-RPC 调用作为兜底, 并增加重试机制(使用通用 HTTP 重试封装)
         payload = {
             "jsonrpc": "2.0",
             "id": 1,
@@ -1372,14 +958,9 @@ def get_wallet_balances(
         data = http_resp.json()
         sol_lamports = int(data.get("result", {}).get("value", 0))
 
-
-
-
-    # 查询 USDC 余额（内部同样带有原始 JSON-RPC 兜底）
+    # 查询 USDC 余额(内部同样带有原始 JSON-RPC 兜底)
     usdc_units = get_usdc_balance(client, owner_pubkey, usdc_mint, logger, rpc_url)
-
     return sol_lamports, usdc_units
-
 
 
 def wait_for_transaction_confirmation(
@@ -1390,9 +971,8 @@ def wait_for_transaction_confirmation(
     timeout_s: int = 60,
     poll_interval_s: int = 2,
 ) -> bool:
-    """轮询指定交易签名的确认状态, 在给定超时时间内等待其达到 confirmed/finalized。
-
-    返回 True 表示交易确认成功, False 表示超时或确认失败。
+    """轮询指定交易签名的确认状态, 在给定超时时间内等待其达到 confirmed/finalized. 
+    返回 True 表示交易确认成功, False 表示超时或确认失败. 
     """
 
     # 优先使用 cfg.rpc_url 传入的地址, 否则尝试从 client 中获取
@@ -1439,16 +1019,12 @@ def wait_for_transaction_confirmation(
                     # 尝试通过属性构造一个简单的 dict 视图
                     status = {
                         "err": getattr(status, "err", None),
-                        "confirmationStatus": getattr(
-                            status, "confirmation_status", None
-                        ),
+                        "confirmationStatus": getattr(status, "confirmation_status", None),
                     }
 
                 last_status = status
                 err = status.get("err")
-                conf_status = status.get("confirmationStatus") or status.get(
-                    "confirmation_status"
-                )
+                conf_status = status.get("confirmationStatus") or status.get("confirmation_status")
 
                 if err:
                     logger.error("交易 %s 在链上确认失败: %s", signature, err)
@@ -1477,10 +1053,6 @@ def wait_for_transaction_confirmation(
     return False
 
 
-
-
-
-
 def http_request_with_retry(
     cfg: Optional[AppConfig],
     logger: logging.Logger,
@@ -1498,21 +1070,19 @@ def http_request_with_retry(
     response_hook: Optional[Callable[[requests.Response, int, int], None]] = None,
 ) -> requests.Response:
 
-    """通用 HTTP 请求重试封装。
-
-    - 不关注具体业务，只处理: 重试、超时、HTTP 状态码、余额不足等通用模式
+    """通用 HTTP 请求重试封装. 
+    - 不关注具体业务, 只处理: 重试、超时、HTTP 状态码、余额不足等通用模式
     - 具体的 JSON 解析和字段校验由调用方负责
     - 可选 response_hook: 每次非 200 响应时调用, 便于业务层输出更细日志
     """
 
     if cfg is None and (max_attempts is None or sleep_s is None):
-        raise ValueError("http_request_with_retry 需要 cfg 或显式提供 max_attempts 和 sleep_s。")
+        raise ValueError("http_request_with_retry 需要 cfg 或显式提供 max_attempts 和 sleep_s. ")
 
     if max_attempts is None:
         max_attempts = cfg.retry_max_attempts  # type: ignore[union-attr]
     if sleep_s is None:
         sleep_s = cfg.retry_sleep_s  # type: ignore[union-attr]
-
 
     resp: Optional[requests.Response] = None
     last_resp_text = ""
@@ -1566,14 +1136,12 @@ def http_request_with_retry(
                         hook_e,
                     )
 
-            # 余额不足类错误视为致命错误，立即终止，不再重试
+            # 余额不足类错误视为致命错误, 立即终止, 不再重试
             if treat_insufficient_as_fatal:
                 lower_msg = last_resp_text.lower()
-                if ("insufficient" in lower_msg and "fund" in lower_msg) or (
-                    "余额不足" in last_resp_text
-                ):
-                    logger.error("%s失败，检测到可能的余额不足: %s", label, last_resp_text)
-                    raise RuntimeError(f"{label}失败：余额不足或资金不足。")
+                if ("insufficient" in lower_msg and "fund" in lower_msg) or ("余额不足" in last_resp_text):
+                    logger.error("%s失败, 检测到可能的余额不足: %s", label, last_resp_text)
+                    raise RuntimeError(f"{label}失败：余额不足或资金不足. ")
 
             if attempt >= max_attempts:
                 logger.error(
@@ -1583,9 +1151,7 @@ def http_request_with_retry(
                     resp.status_code,
                     last_resp_text,
                 )
-                raise RuntimeError(
-                    f"{label}失败, HTTP {resp.status_code}: {last_resp_text}"
-                )
+                raise RuntimeError(f"{label}失败, HTTP {resp.status_code}: {last_resp_text}")
 
             logger.warning(
                 "%s失败(尝试 %d/%d), HTTP %d: %s",
@@ -1599,13 +1165,8 @@ def http_request_with_retry(
         if attempt < max_attempts:
             time.sleep(sleep_s)
 
-    # 理论上不会到这里，防御性处理
-    raise RuntimeError(
-        f"{label}失败, HTTP {getattr(resp, 'status_code', '未知')}: {last_resp_text}"
-    )
-
-
-
+    # 理论上不会到这里, 防御性处理
+    raise RuntimeError(f"{label}失败, HTTP {getattr(resp, 'status_code', '未知')}: {last_resp_text}")
 
 def _send_signed_tx_via_ultra_execute(
     cfg: AppConfig,
@@ -1617,10 +1178,9 @@ def _send_signed_tx_via_ultra_execute(
     insufficient_token_name: str,
     enable_decode_retry: bool = False,
 ) -> tuple[bool, Optional[dict], Optional[str]]:
-    """发送已签名的交易到 Jupiter Ultra /execute, 带重试与余额不足检测。
-
-    重试与余额不足检测通过 http_request_with_retry 统一处理。
-    enable_decode_retry 目前仅用于额外日志提示, 不改变重试策略。
+    """发送已签名的交易到 Jupiter Ultra /execute, 带重试与余额不足检测. 
+    重试与余额不足检测通过 http_request_with_retry 统一处理. 
+    enable_decode_retry 目前仅用于额外日志提示, 不改变重试策略. 
     """
 
     execute_url = f"{JUPITER_ULTRA_API_BASE}/execute"
@@ -1660,11 +1220,7 @@ def _send_signed_tx_via_ultra_execute(
         logger.error("解析 %s execute 响应 JSON 失败: %s, 原始响应: %s", trade_label, e, resp.text)
         error_reason = f"执行 {trade_label} 交易失败: 无法解析节点响应 JSON: {e}"
         return False, None, error_reason
-
     return True, exec_result, None
-
-
-
 
 def _execute_first_leg(
 
@@ -1682,9 +1238,9 @@ def _execute_first_leg(
     trade_amount_sol_display: float,
     amount_sol_lamports: int,
 ) -> tuple[bool, dict, Optional[str], Optional[int]]:
-    """执行第一步 SOL->USDC 交易。
+    """执行第一步 SOL->USDC 交易. 
 
-    保持与原有业务逻辑一致, 仅作结构拆分以便维护。
+    保持与原有业务逻辑一致, 仅作结构拆分以便维护. 
     """
 
     error_reason: Optional[str] = None
@@ -1696,7 +1252,7 @@ def _execute_first_leg(
         trade_amount_sol_display,
     )
 
-    # 记录第一笔交易前的钱包余额（暂时注释掉，减少 RPC 调用）
+    # 记录第一笔交易前的钱包余额(暂时注释掉, 减少 RPC 调用)
     # try:
     #     sol_before_leg1, usdc_before_leg1 = get_wallet_balances(
     #         client, wallet_pubkey, usdc_mint, logger, cfg.rpc_url
@@ -1713,7 +1269,7 @@ def _execute_first_leg(
     # except Exception as e:  # noqa: BLE001
     #     logger.error("获取第一步前钱包余额失败: %s", e)
 
-    # 调用 Jupiter Ultra API 获取订单（包含报价和交易）
+    # 调用 Jupiter Ultra API 获取订单(包含报价和交易)
     try:
         order_url = (
             f"{JUPITER_ULTRA_API_BASE}/order"
@@ -1722,11 +1278,6 @@ def _execute_first_leg(
             f"&amount={amount_sol_lamports}"
             f"&taker={wallet_pubkey}"
         )
-
-        # # 可选：添加 referral 参数以收取集成商费用
-        # if cfg.enable_referral and _referral_account:
-        #     order_url += f"&referralAccount={_referral_account}"
-        #     order_url += f"&referralFee={cfg.referral_fee}"
 
         logger.debug("请求 SOL->USDC 订单: %s", order_url)
 
@@ -1776,7 +1327,7 @@ def _execute_first_leg(
         return False, stats, error_reason, None
 
     logger.info(
-        "SOL->USDC 订单成功: 输入=%d lamports, 预计输出=%d USDC 最小单位。",
+        "SOL->USDC 订单成功: 输入=%d lamports, 预计输出=%d USDC 最小单位. ",
         amount_sol_lamports,
         out_usdc_amount,
     )
@@ -1878,7 +1429,7 @@ def _execute_first_leg(
         poll_interval_s=2,
     ):
         error_reason = (
-            f"SOL->USDC 交易 {sig1} 在 {confirm_timeout} 秒内未确认或确认失败, 无法执行后续 USDC->SOL 交易。"
+            f"SOL->USDC 交易 {sig1} 在 {confirm_timeout} 秒内未确认或确认失败, 无法执行后续 USDC->SOL 交易. "
         )
         return False, stats, error_reason, None
 
@@ -1901,10 +1452,10 @@ def _execute_first_leg(
         )
         if current_usdc_balance <= 0:
             logger.error(
-                "当前 USDC 余额(%d) 小于等于 0, 无法执行 USDC->SOL 交易。",
+                "当前 USDC 余额(%d) 小于等于 0, 无法执行 USDC->SOL 交易. ",
                 current_usdc_balance,
             )
-            error_reason = "当前 USDC 余额不足, 无法执行 USDC->SOL 交易。"
+            error_reason = "当前 USDC 余额不足, 无法执行 USDC->SOL 交易. "
             return False, stats, error_reason, None
 
         # 每笔交易后的余额快照(第 1 笔之后 / 第 2 笔之前)
@@ -1921,7 +1472,7 @@ def _execute_first_leg(
 
     except Exception as e:  # noqa: BLE001
         logger.error(
-            "查询 USDC/SOL 余额失败: %s, 无法执行 USDC->SOL 交易。",
+            "查询 USDC/SOL 余额失败: %s, 无法执行 USDC->SOL 交易. ",
             e,
         )
         error_reason = f"查询 USDC/SOL 余额失败: {e}"
@@ -1946,15 +1497,14 @@ def _execute_second_leg(
     usdc_mint: str,
     effective_usdc_amount: int,
 ) -> tuple[bool, dict, Optional[str]]:
-    """执行第二步 USDC->SOL 交易。
+    """执行第二步 USDC->SOL 交易. 
 
-    保持与原有业务逻辑一致, 仅作结构拆分以便维护。
+    保持与原有业务逻辑一致, 仅作结构拆分以便维护. 
     """
 
     error_reason: Optional[str] = None
 
     # -------- 第二步: USDC -> SOL --------
-
     logger.info(
         "一对交易-第 2 步: 准备将上一步获得的 USDC 换回 SOL...",
     )
@@ -1968,11 +1518,6 @@ def _execute_second_leg(
             f"&amount={effective_usdc_amount}"
             f"&taker={wallet_pubkey}"
         )
-
-        # # 可选：添加 referral 参数以收取集成商费用
-        # if cfg.enable_referral and _referral_account:
-        #     order_url2 += f"&referralAccount={_referral_account}"
-        #     order_url2 += f"&referralFee={cfg.referral_fee}"
 
         logger.debug("请求 USDC->SOL 订单: %s", order_url2)
 
@@ -2023,7 +1568,7 @@ def _execute_second_leg(
         return False, stats, error_reason
 
     logger.info(
-        "USDC->SOL 订单成功: 输入=%d USDC 最小单位, 预计输出=%.9f SOL (lamports=%d)。",
+        "USDC->SOL 订单成功: 输入=%d USDC 最小单位, 预计输出=%.9f SOL (lamports=%d). ",
         effective_usdc_amount,
         out_sol_lamports / 1_000_000_000,
         out_sol_lamports,
@@ -2131,7 +1676,6 @@ def _execute_second_leg(
             )
         except Exception as e:  # noqa: BLE001
             logger.error("获取第二步后钱包余额失败: %s", e)
-
     except Exception as e:  # noqa: BLE001
         logger.error("发送 USDC->SOL 交易失败: %s", e)
         logger.debug("USDC->SOL 发送异常堆栈:\n%s", traceback.format_exc())
@@ -2141,10 +1685,7 @@ def _execute_second_leg(
     return True, stats, None
 
 
-
-def execute_trade_pair(
-
-
+def execute_trade_pair (
     client: Client,  # 保留参数以兼容现有调用, 当前未直接使用
     keypair: Keypair,
     cfg: AppConfig,
@@ -2152,7 +1693,7 @@ def execute_trade_pair(
     tx_logger: logging.Logger,
 ) -> tuple[bool, dict, Optional[str]]:
 
-    """执行"一对交易" (SOL->USDC->SOL)。
+    """执行"一对交易" (SOL->USDC->SOL). 
 
     返回 (success, stats, error_reason):
     - success: 是否成功完成一对交易
@@ -2174,11 +1715,6 @@ def execute_trade_pair(
         }, f"执行一对交易时发生未捕获异常: {e}"
 
 
-
-
-
-
-
 def run_trading_loop(
     cfg: AppConfig,
     client: Client,
@@ -2189,7 +1725,7 @@ def run_trading_loop(
     mode: str,
     execute_round_fn,
 ) -> None:
-    """通用自动交易循环。
+    """通用自动交易循环. 
 
     - Ultra 模式: execute_round_fn=execute_trade_pair, 每轮执行一对交易 (SOL->USDC->SOL)
     - Legacy 模式: execute_round_fn=exec_legacy_tx, 每轮执行一笔 Legacy Swap (SOL->USDC)
@@ -2197,20 +1733,20 @@ def run_trading_loop(
 
     if mode == "ultra":
         logger.info(
-            '开始进入自动交易循环，每一轮都会执行"一对交易" (SOL->USDC->SOL)，按 Ctrl + C 可手动停止程序。'
+            '开始进入自动交易循环, 每一轮都会执行"一对交易" (SOL->USDC->SOL), 按 Ctrl + C 可手动停止程序. '
         )
     else:
         logger.info(
-            '开始进入自动交易循环，每一轮都会执行 Legacy 一对交易 (SOL->USDC->SOL)，按 Ctrl + C 可手动停止程序。'
+            '开始进入自动交易循环, 每一轮都会执行 Legacy 一对交易 (SOL->USDC->SOL), 按 Ctrl + C 可手动停止程序. '
         )
 
     success_pairs = 0
 
-    # 文案标签：Ultra 使用“一对交易”，Legacy 使用“Legacy 一对交易”
+    # 文案标签：Ultra 使用“一对交易”, Legacy 使用“Legacy 一对交易”
     unit_label = "一对交易" if mode == "ultra" else "Legacy 一对交易"
 
 
-    # 记录本轮中最后一次失败的交易的原因（如有）
+    # 记录本轮中最后一次失败的交易的原因(如有)
     last_error_reason: Optional[str] = None
 
     # 本轮运行的累计统计数据
@@ -2219,17 +1755,16 @@ def run_trading_loop(
     total_usdc_spent_units = 0
     total_sol_bought_lamports = 0
 
-
     while success_pairs < cfg.max_runs:
         try:
             if not cfg.enable_trading:
                 if mode == "ultra":
                     logger.info(
-                        "当前配置已关闭真实交易（enable_trading=false），本轮仅做心跳检查, 视为一对交易成功。"
+                        "当前配置已关闭真实交易(enable_trading=false), 本轮仅做心跳检查, 视为一对交易成功. "
                     )
                 else:
                     logger.info(
-                        "当前配置已关闭真实交易（enable_trading=false），本轮仅做心跳检查, 视为一笔 Legacy 一对交易成功。"
+                        "当前配置已关闭真实交易(enable_trading=false), 本轮仅做心跳检查, 视为一笔 Legacy 一对交易成功. "
                     )
 
                 pair_ok = True
@@ -2248,7 +1783,6 @@ def run_trading_loop(
                         "开始执行第 %d 次 Legacy 一对交易 (SOL->USDC->SOL)...",
                         success_pairs + 1,
                     )
-
 
                 # 每轮交易开始时记录钱包当前余额
                 try:
@@ -2304,7 +1838,7 @@ def run_trading_loop(
                 # 记录本次失败原因, 并在交易日志中输出
                 last_error_reason = (
                     pair_error
-                    or f"{unit_label}执行失败, 具体原因请查看 app.log 中的上一条 ERROR 日志。"
+                    or f"{unit_label}执行失败, 具体原因请查看 app.log 中的上一条 ERROR 日志. "
                 )
                 tx_logger.info(
                     "本次 %s 失败 原因=%s",
@@ -2312,7 +1846,7 @@ def run_trading_loop(
                     last_error_reason,
                 )
 
-                # 如果是余额不足类错误，视为致命错误，立即终止自动交易循环
+                # 如果是余额不足类错误, 视为致命错误, 立即终止自动交易循环
                 if last_error_reason:
                     lower_reason = last_error_reason.lower()
                     if (
@@ -2321,29 +1855,26 @@ def run_trading_loop(
                         or "insufficient" in lower_reason
                     ):
                         logger.error(
-                            "检测到余额不足相关错误(原因=%s)，自动交易循环将立即终止，不再继续后续轮次。",
+                            "检测到余额不足相关错误(原因=%s), 自动交易循环将立即终止, 不再继续后续轮次. ",
                             last_error_reason,
                         )
                         break
-
-
-
         except KeyboardInterrupt:
             # 用户主动终止程序
-            logger.info("检测到用户中断（Ctrl + C），程序即将优雅退出。")
+            logger.info("检测到用户中断(Ctrl + C), 程序即将优雅退出. ")
             break
         except Exception as e:  # noqa: BLE001
-            # 兜底异常处理，保证任何异常都有清晰日志
+            # 兜底异常处理, 保证任何异常都有清晰日志
             logger.error("主循环中出现未捕获异常：%s", e)
             logger.debug("主循环未捕获异常堆栈：\n%s", traceback.format_exc())
             break
 
         if pair_ok:
             success_pairs += 1
-            logger.info("第 %d 次 %s 执行成功。", success_pairs, unit_label)
+            logger.info("第 %d 次 %s 执行成功. ", success_pairs, unit_label)
         else:
             logger.error(
-                "本次 %s 执行失败, 不计入成功次数。本轮将继续尝试下一次 %s（当前为测试模式，不终止循环）。",
+                "本次 %s 执行失败, 不计入成功次数. 本轮将继续尝试下一次 %s(当前为测试模式, 不终止循环). ",
                 unit_label,
                 unit_label,
             )
@@ -2353,15 +1884,14 @@ def run_trading_loop(
 
         if success_pairs >= cfg.max_runs:
             logger.info(
-                "已完成配置要求的 %s 成功次数 max_runs=%d, 程序将退出。",
+                "已完成配置要求的 %s 成功次数 max_runs=%d, 程序将退出. ",
                 unit_label,
                 cfg.max_runs,
             )
-
             break
 
         # 间隔一段时间后, 在下一笔交易前休眠一段时间
-        logger.debug("本次一对交易结束, 休眠 %d 秒后继续下一笔交易。", cfg.tx_interval_s)
+        logger.debug("本次一对交易结束, 休眠 %d 秒后继续下一笔交易. ", cfg.tx_interval_s)
         time.sleep(cfg.tx_interval_s)
 
     # 5. 本轮运行结束后的统计输出
@@ -2369,7 +1899,7 @@ def run_trading_loop(
         logger.info(
             "本轮统计: 成功 %s 次数=%d, 初始花费 SOL 总数=%.9f SOL (lamports=%d), "
             "获得 USDC 总数≈%.6f USDC (最小单位=%d), 花费 USDC 总数≈%.6f USDC (最小单位=%d), "
-            "最终买回 SOL 总数=%.9f SOL (lamports=%d)。",
+            "最终买回 SOL 总数=%.9f SOL (lamports=%d). ",
             unit_label,
             success_pairs,
             total_sol_spent_lamports / 1_000_000_000 if total_sol_spent_lamports else 0.0,
@@ -2384,7 +1914,7 @@ def run_trading_loop(
         tx_logger.info(
             "本轮统计: 成功 %s 次数=%d, 初始花费 SOL 总数=%.9f SOL (lamports=%d), "
             "获得 USDC 总数≈%.6f USDC (最小单位=%d), 花费 USDC 总数≈%.6f USDC (最小单位=%d), "
-            "最终买回 SOL 总数=%.9f SOL (lamports=%d)。",
+            "最终买回 SOL 总数=%.9f SOL (lamports=%d). ",
             unit_label,
             success_pairs,
             total_sol_spent_lamports / 1_000_000_000 if total_sol_spent_lamports else 0.0,
@@ -2397,41 +1927,37 @@ def run_trading_loop(
             total_sol_bought_lamports,
         )
 
-        # Legacy 模式下输出一行专用的 USDC 汇总统计，便于快速查看总输出
+        # Legacy 模式下输出一行专用的 USDC 汇总统计, 便于快速查看总输出
         if mode == "legacy":
             logger.info(
-                "Legacy 模式专用统计: 累计获得 USDC ≈%.6f USDC (最小单位=%d)。",
+                "Legacy 模式专用统计: 累计获得 USDC ≈%.6f USDC (最小单位=%d). ",
                 total_usdc_received_units / 1_000_000 if total_usdc_received_units else 0.0,
                 total_usdc_received_units,
             )
             tx_logger.info(
-                "Legacy 模式专用统计: 累计获得 USDC ≈%.6f USDC (最小单位=%d)。",
+                "Legacy 模式专用统计: 累计获得 USDC ≈%.6f USDC (最小单位=%d). ",
                 total_usdc_received_units / 1_000_000 if total_usdc_received_units else 0.0,
                 total_usdc_received_units,
             )
 
         if last_error_reason:
-
             logger.error("本轮存在交易失败, 失败原因: %s", last_error_reason)
             tx_logger.info("本轮存在交易失败, 失败原因: %s", last_error_reason)
-
     else:
         logger.info(
-            "本轮统计: 当前 enable_trading=false, 未发送任何真实交易。成功 %s 次数=%d, 统计的 SOL/USDC 数量均为 0。",
+            "本轮统计: 当前 enable_trading=false, 未发送任何真实交易. 成功 %s 次数=%d, 统计的 SOL/USDC 数量均为 0. ",
             unit_label,
             success_pairs,
         )
         tx_logger.info(
-            "本轮统计: 当前 enable_trading=false, 未发送任何真实交易。成功 %s 次数=%d, 统计的 SOL/USDC 数量均为 0。",
+            "本轮统计: 当前 enable_trading=false, 未发送任何真实交易. 成功 %s 次数=%d, 统计的 SOL/USDC 数量均为 0. ",
             unit_label,
             success_pairs,
         )
 
 
-
-
 def run_auto_trader() -> None:
-    """主入口：加载配置、初始化客户端并循环执行自动交易。"""
+    """主入口：加载配置、初始化客户端并循环执行自动交易. """
 
     logger, tx_logger = setup_logging()
     logger.info("===== 启动 Solana 自动交易程序 =====")
@@ -2440,7 +1966,7 @@ def run_auto_trader() -> None:
     try:
         cfg = load_config(CONFIG_PATH)
     except Exception as e:  # noqa: BLE001
-        # 配置相关错误通常是最常见的问题，需要给用户极其清晰的提示
+        # 配置相关错误通常是最常见的问题, 需要给用户极其清晰的提示
         logger.error("加载配置失败：%s", e)
         logger.debug("加载配置异常堆栈：\n%s", traceback.format_exc())
         return
@@ -2456,7 +1982,6 @@ def run_auto_trader() -> None:
         cfg.max_runs,
     )
 
-
     # 2. 初始化私钥
     try:
         keypair = load_keypair_from_base58(cfg.private_key)
@@ -2467,7 +1992,7 @@ def run_auto_trader() -> None:
 
     # 6b2U9GpqJn8eXFTRFsV4D9XRf7HAx3YprF2qdWU1oqPt
     wallet_pubkey = str(keypair.pubkey())
-    logger.info("私钥加载成功，钱包地址：%s", wallet_pubkey)
+    logger.info("私钥加载成功, 钱包地址：%s", wallet_pubkey)
 
 
     # 3. 初始化 RPC 客户端
@@ -2475,7 +2000,7 @@ def run_auto_trader() -> None:
         client = build_client(cfg)
         # 测试连通性
         version = client.get_version()
-        logger.info("RPC 连接成功，节点版本信息：%s", version)
+        logger.info("RPC 连接成功, 节点版本信息：%s", version)
     except Exception as e:  # noqa: BLE001
         logger.error("初始化 RPC 客户端或测试连接失败：%s", e)
         logger.debug("RPC 初始化异常堆栈：\n%s", traceback.format_exc())
@@ -2484,7 +2009,7 @@ def run_auto_trader() -> None:
     # 3.5 根据模式选择执行 Ultra 一对交易循环或 Legacy Swap 循环
     if getattr(cfg, "support_prio_fee", False):
         logger.info(
-            "检测到 support_prio_fee=true，将使用 Jupiter Legacy Swap API 执行自动交易循环，不执行 Ultra 一对交易。"
+            "检测到 support_prio_fee=true, 将使用 Jupiter Legacy Swap API 执行自动交易循环, 不执行 Ultra 一对交易. "
         )
         run_trading_loop(
             cfg=cfg,
@@ -2508,8 +2033,7 @@ def run_auto_trader() -> None:
             execute_round_fn=execute_trade_pair,
         )
 
-    logger.info("===== 程序结束，感谢使用 =====")
-
+    logger.info("===== 程序结束, 感谢使用 =====")
 
 
 if __name__ == "__main__":

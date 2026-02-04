@@ -5,7 +5,7 @@ rem Switch to script directory
 cd /d "%~dp0"
 
 echo ============================================
-echo  Solana Auto Trading Runner
+echo  Solana Auto Trading Runner V2
 echo ============================================
 echo.
 
@@ -20,11 +20,11 @@ if not exist "%VENV_PY%" (
     goto END
 )
 
-echo Running auto trading script...
-echo Command: "%VENV_PY%" auto.py
+echo Running auto trading script V2...
+echo Command: "%VENV_PY%" auto_v2.py
 echo.
 
-"%VENV_PY%" auto.py
+"%VENV_PY%" auto_v2.py
 
 :END
 echo.
