@@ -547,7 +547,7 @@ class AppConfig:
     retry_sleep_s: int  # 外部 HTTP/RPC 重试间隔秒数
     slippage_bps: int  # Legacy Swap 使用的滑点（单位：bps）
     priority_fee: int  # Legacy Swap 使用的优先费（单位：lamports）
-    legacy_mode: bool  # 是否启用 Legacy 单笔 Swap 模式
+    support_prio_fee: bool  # 是否启用 Legacy 单笔 Swap 模式
 
 
 
@@ -692,7 +692,7 @@ def load_config(path: str) -> AppConfig:
     # Legacy Swap 相关配置（用于 priority_fee / slippage）
     slippage_bps = int(raw.get("slippage_bps", 0))
     priority_fee = int(raw.get("priority_fee", 0))
-    legacy_mode = bool(raw.get("legacy_mode", False))
+    support_prio_fee = bool(raw.get("support_prio_fee", False))
 
     cfg = AppConfig(
 
@@ -713,7 +713,7 @@ def load_config(path: str) -> AppConfig:
         retry_sleep_s=retry_sleep_s,
         slippage_bps=slippage_bps,
         priority_fee=priority_fee,
-        legacy_mode=legacy_mode,
+        support_prio_fee=support_prio_fee,
     )
 
 
@@ -2482,9 +2482,9 @@ def run_auto_trader() -> None:
         return
 
     # 3.5 根据模式选择执行 Ultra 一对交易循环或 Legacy Swap 循环
-    if getattr(cfg, "legacy_mode", False):
+    if getattr(cfg, "support_prio_fee", False):
         logger.info(
-            "检测到 legacy_mode=true，将使用 Jupiter Legacy Swap API 执行自动交易循环，不执行 Ultra 一对交易。"
+            "检测到 support_prio_fee=true，将使用 Jupiter Legacy Swap API 执行自动交易循环，不执行 Ultra 一对交易。"
         )
         run_trading_loop(
             cfg=cfg,
