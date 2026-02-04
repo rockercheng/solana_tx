@@ -32,10 +32,8 @@ import traceback
 import hashlib
 from dataclasses import dataclass
 from typing import Optional
-
 import base64
 import random
-
 import requests
 
 from solders.keypair import Keypair
@@ -45,11 +43,9 @@ from solders.pubkey import Pubkey
 from solders.instruction import Instruction, AccountMeta
 from solders.system_program import ID as SYSTEM_PROGRAM_ID
 from solders.message import MessageV0
-
 from solana.rpc.api import Client
 from solana.rpc.types import TokenAccountOpts
 from spl.token.constants import TOKEN_PROGRAM_ID
-
 
 
 # ===== 全局常量 =====
@@ -68,8 +64,7 @@ ULTRA_API_KEY = "72675114-cb71-4b8b-8c21-c429b1082843"
 # referralAccount: 你的推荐账户公钥 (需要先在链上创建)
 # referralFee: 费用基点 (50-255 bps, 例如 50 = 0.5%)
 REFERRAL_ACCOUNT_CONFIG = ""  # 填入你的 referralAccount 公钥，留空则自动创建
-# REFERRAL_FEE = 50  # 费用基点，范围 50-255
-REFERRAL_FEE = 3
+# referral_fee 已移入 config.json
 
 # 运行时使用的 referral account (会在程序启动时设置)
 _referral_account: str = ""
@@ -83,13 +78,9 @@ JUPITER_REFERRAL_PROGRAM_ID = "REFER4ZgmyYx9c6He5XfaTMiGfdLwRnkV4RPp9t9iF3"
 REFERRAL_NAME = "solana_auto_trader"
 
 
-
-
 # 可以通过环境变量 SOLANA_AUTO_CONFIG 覆盖配置文件路径
 DEFAULT_CONFIG_PATH = "config.json"
 CONFIG_PATH = os.environ.get("SOLANA_AUTO_CONFIG", DEFAULT_CONFIG_PATH)
-
-
 
 @dataclass
 class AppConfig:
@@ -107,12 +98,7 @@ class AppConfig:
     tx_interval_s: int
     enable_trading: bool
     max_runs: int
-    proxy: Optional[str]  # HTTP 代理地址，如 "http://127.0.0.1:7890"
-
-
-
-
-
+    referral_fee: int  # Referral 费用基点  官网 50-255
 
 
 def setup_logging(log_dir: str = "logs") -> tuple[logging.Logger, logging.Logger]:
@@ -164,7 +150,6 @@ def setup_logging(log_dir: str = "logs") -> tuple[logging.Logger, logging.Logger
     tx_file_handler.setLevel(logging.INFO)
     tx_file_handler.setFormatter(log_format)
     tx_logger.addHandler(tx_file_handler)
-
     return logger, tx_logger
 
 
@@ -243,6 +228,9 @@ def load_config(path: str) -> AppConfig:
             f"配置项 trade_amount_min={trade_amount_min} 大于 trade_amount_max={trade_amount_max}, 请填写正确的范围。"
         )
 
+    # Referral 费用基点，默认 3
+    referral_fee = int(raw.get("referral_fee", 3))
+
     cfg = AppConfig(
         network=network,
         rpc_url=rpc_url,
@@ -255,14 +243,9 @@ def load_config(path: str) -> AppConfig:
         tx_interval_s=int(raw.get("tx_interval_s", 60)),
         enable_trading=bool(raw.get("enable_trading", True)),
         max_runs=max_runs,
-        proxy=raw.get("proxy") or None,
+        referral_fee=referral_fee,
     )
-
-
-
     return cfg
-
-
 
 
 def _execute_trade_pair_once(
@@ -387,7 +370,7 @@ def _execute_trade_pair_once(
         # 可选：添加 referral 参数以收取集成商费用
         if _referral_account:
             order_url += f"&referralAccount={_referral_account}"
-            order_url += f"&referralFee={REFERRAL_FEE}"
+            order_url += f"&referralFee={cfg.referral_fee}"
 
         logger.debug("请求 SOL->USDC 订单: %s", order_url)
 
@@ -399,14 +382,11 @@ def _execute_trade_pair_once(
             error_reason = f"获取 SOL->USDC 订单失败, HTTP {resp.status_code}: {resp.text}"
             return False, stats, error_reason
         order1 = resp.json()
-
     except Exception as e:  # noqa: BLE001
         logger.error("获取 SOL->USDC 订单失败: %s", e)
         logger.debug("SOL->USDC 订单异常堆栈:\n%s", traceback.format_exc())
         error_reason = f"获取 SOL->USDC 订单失败: {e}"
         return False, stats, error_reason
-
-
 
     out_usdc_amount = int(order1.get("outAmount", 0))
     if out_usdc_amount <= 0:
@@ -550,7 +530,6 @@ def _execute_trade_pair_once(
             sig1,
         )
 
-
     except Exception as e:  # noqa: BLE001
         logger.error("发送 SOL->USDC 交易失败: %s", e)
         logger.debug("SOL->USDC 发送异常堆栈:\n%s", traceback.format_exc())
@@ -638,7 +617,7 @@ def _execute_trade_pair_once(
         # 可选：添加 referral 参数以收取集成商费用
         if _referral_account:
             order_url2 += f"&referralAccount={_referral_account}"
-            order_url2 += f"&referralFee={REFERRAL_FEE}"
+            order_url2 += f"&referralFee={cfg.referral_fee}"
 
         logger.debug("请求 USDC->SOL 订单: %s", order_url2)
 
@@ -1032,7 +1011,7 @@ def init_referral_account(
         logger.info("Solscan: https://solscan.io/tx/%s", signature)
         
         # 等待确认
-        time.sleep(3)
+        time.sleep(10)
         logger.info("Referral Account 创建成功: %s", str(referral_account_pda))
         return str(referral_account_pda)
         
@@ -1133,7 +1112,7 @@ def init_referral_token_account(
         logger.info("Solscan: https://solscan.io/tx/%s", signature)
         
         # 等待确认
-        time.sleep(3)
+        time.sleep(10)
         logger.info("Referral Token Account 创建成功: %s", str(referral_token_account_pda))
         return str(referral_token_account_pda)
         
@@ -1205,19 +1184,25 @@ def get_or_create_referral_account(
     if REFERRAL_ACCOUNT_CONFIG:
         logger.info("使用已配置的 Referral Account: %s", REFERRAL_ACCOUNT_CONFIG)
         return REFERRAL_ACCOUNT_CONFIG
-    
+
     # 检查是否可以派生已存在的账户
     partner_pubkey = keypair.pubkey()
     project_pubkey = Pubkey.from_string(JUPITER_REFERRAL_PROJECT_PUBKEY)
     referral_account_pda, _ = derive_referral_account_pda(partner_pubkey, project_pubkey)
     
+    logger.info("检查 Referral Account PDA: %s", str(referral_account_pda))
+    
     try:
         account_info = client.get_account_info(referral_account_pda)
+        logger.debug("get_account_info 响应: %s", account_info)
         if account_info.value is not None:
             logger.info("发现已存在的 Referral Account: %s", str(referral_account_pda))
             return str(referral_account_pda)
-    except Exception:
-        pass
+        else:
+            logger.info("链上查询结果: 账户不存在 (value is None)")
+    except Exception as e:
+        logger.warning("查询 Referral Account 时出错: %s", e)
+        logger.debug("查询异常堆栈:\n%s", traceback.format_exc())
     
     logger.info("未找到 Referral Account，将自动创建...")
     return setup_referral_accounts(client, keypair, logger)
