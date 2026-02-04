@@ -22,7 +22,10 @@ Solana 自动交易脚本示例。
 在真实主网上使用前，请务必在测试网充分验证、控制金额、了解风险。
 """
 
+from __future__ import annotations
+
 import json
+
 import logging
 import logging.handlers
 import os
@@ -31,23 +34,25 @@ import time
 import traceback
 import hashlib
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Callable
+
 import base64
 import base58
 import random
 import requests
 
 from solders.keypair import Keypair
-from solders.transaction import VersionedTransaction
+from solders.transaction import VersionedTransaction, Transaction as LegacyTransaction
 from solders import message as solders_message
 from solders.pubkey import Pubkey
 from solana.rpc.api import Client
 from solana.rpc.types import TokenAccountOpts
-from solana.transaction import Transaction
+
 # from solders.instruction import Instruction, AccountMeta
 # from solders.system_program import ID as SYSTEM_PROGRAM_ID
 # from solders.message import MessageV0
 # from spl.token.constants import TOKEN_PROGRAM_ID
+
 
 
 # ===== 全局常量 =====
@@ -61,7 +66,10 @@ USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 # JUPITER_ULTRA_API_BASE = "https://ultra-api.jup.ag"
 JUPITER_ULTRA_API_BASE = "https://api.jup.ag/ultra/v1"
 ULTRA_API_KEY = "72675114-cb71-4b8b-8c21-c429b1082843"
-JUPITER_LEGACY_API_BASE = "https://api.jup.ag/swap/v1"
+
+# Jupiter Legacy Swap API 基础 URL（用于优先费 / 滑点可配置的单笔 Swap）
+# JUPITER_LEGACY_API_BASE = "https://api.jup.ag/swap/v1"
+JUPITER_LEGACY_API_BASE = "https://api.jup.ag/legacy/swap"
 
 
 # 默认 RPC URL 常量，便于集中管理和修改
@@ -89,79 +97,433 @@ DEFAULT_TESTNET_RPC_URL = "https://solana-testnet.api.onfinality.io/public"
 DEFAULT_CONFIG_PATH = "config.json"
 CONFIG_PATH = os.environ.get("SOLANA_AUTO_CONFIG", DEFAULT_CONFIG_PATH)
 
-# -------------------------- 2. 请求Legacy API获取交易指令 --------------------------
-def get_swap_transaction():
-    """请求Legacy Swap API，获取包含自定义priorityFee的交易指令"""
+# -------------------------- 2. 请求 Legacy API 获取交易指令 --------------------------
+def legacy_get_swap_transaction(
+    cfg: AppConfig,
+    logger: logging.Logger,
+    input_mint: str,
+    output_mint: str,
+    amount_lamports: int,
+    user_pubkey: str,
+):
+    """请求 Legacy Swap API，获取包含自定义 priority_fee / slippage 的交易指令。
+
+    使用 config.json 中的 slippage_bps / priority_fee，不影响 Ultra 逻辑。
+    失败时抛出异常，由上层捕获并记录。
+    """
+
     headers = {"Content-Type": "application/json"}
     payload = {
-        "inputMint": INPUT_MINT,
-        "outputMint": OUTPUT_MINT,
-        "amount": AMOUNT,
-        "slippageBps": SLIPPAGE_BPS,
-        "userPublicKey": USER_PUBKEY,
-        # 核心：设置自定义优先费用（2种方式二选一，推荐方式1）
-        # 方式1：直接设置具体优先费用金额（Lamports）
-        "prioritizationFeeLamports": PRIORITY_FEE,
-        # 方式2：设置计算单元价格（可选，与prioritizationFeeLamports二选一）
-        # "computeUnitPriceMicroLamports": 1000  # 计算单元价格，用于自动计算优先费
+        "inputMint": input_mint,
+        "outputMint": output_mint,
+        "amount": amount_lamports,
+        "slippageBps": int(getattr(cfg, "slippage_bps", 0)),
+        "userPublicKey": user_pubkey,
+        # 文档示例中使用 priorityFee 字段（单位：lamports）
+        "priorityFee": int(getattr(cfg, "priority_fee", 0)),
     }
-    
+
+    logger.debug("Legacy Swap 请求: url=%s payload=%s", JUPITER_LEGACY_API_BASE, payload)
+
+    # 定义业务级 response_hook, 在非 200 响应时输出更细日志
+    def _legacy_response_hook(resp: requests.Response, attempt: int, max_attempts: int) -> None:
+        body_preview = resp.text[:500] if resp.text else ""
+        logger.warning(
+            "Legacy Swap 非 200 响应(尝试 %d/%d) status=%d input_mint=%s output_mint=%s amount_lamports=%d user_pubkey=%s body=%s",
+            attempt,
+            max_attempts,
+            resp.status_code,
+            input_mint,
+            output_mint,
+            amount_lamports,
+            user_pubkey,
+            body_preview,
+        )
+
+    # 通过通用重试封装执行 HTTP 请求
+    resp = http_request_with_retry(
+        cfg=cfg,
+        logger=logger,
+        label="请求 Legacy Swap 交易指令",
+        method="POST",
+        url=JUPITER_LEGACY_API_BASE,
+        headers=headers,
+        json_body=payload,
+        timeout=30,
+        treat_insufficient_as_fatal=True,
+        response_hook=_legacy_response_hook,
+    )
+
+
     try:
-        response = requests.post(LEGACY_SWAP_API_URL, headers=headers, json=payload)
-        response.raise_for_status()  # 抛出HTTP请求错误
-        data = response.json()
-        # 提取Base64编码的交易指令
-        swap_tx_base64 = data.get("swapTransaction")
-        if not swap_tx_base64:
-            raise Exception("获取交易指令失败，未返回swapTransaction字段")
-        return swap_tx_base64
-    except Exception as e:
-        print(f"请求交易指令出错：{str(e)}")
-        raise
+        data = resp.json()
+    except Exception as e:  # noqa: BLE001
+        logger.error("解析 Legacy Swap 响应 JSON 失败: %s, 原始响应: %s", e, resp.text)
+        raise RuntimeError(f"解析 Legacy Swap 响应 JSON 失败: {e}") from e
+
+    # 提取 Base64 编码的交易指令
+    swap_tx_base64 = data.get("swapTransaction")
+    if not swap_tx_base64:
+        raise RuntimeError(f"获取交易指令失败，未返回 swapTransaction 字段: {data}")
+
+    logger.info(
+        "Legacy Swap 报价: inputAmount=%s outputAmount=%s priorityFee=%s",
+        data.get("inputAmount"),
+        data.get("outputAmount"),
+        data.get("priorityFee"),
+    )
+    return swap_tx_base64, data
+
+
+
 
 # -------------------------- 3. 解码、签名交易 --------------------------
-def sign_transaction(swap_tx_base64):
-    """解码交易指令，使用用户钱包签名交易"""
-    # 解码Base64交易数据
-    tx_data = base64.b64decode(swap_tx_base64)
-    # 反序列化为Solana交易对象
-    transaction = Transaction.deserialize(tx_data)
-    # 使用用户私钥签名交易
-    transaction.sign(USER_KEYPAIR)
-    # 序列化签名后的交易（用于提交上链）
-    signed_tx = transaction.serialize()
-    # 转为Base64格式，用于提交API
-    signed_tx_base64 = base64.b64encode(signed_tx).decode("utf-8")
-    return signed_tx_base64
+def legacy_sign_transaction(swap_tx_base64: str, user_keypair: Keypair, logger: logging.Logger) -> bytes:
+    """解码交易指令，使用用户钱包签名交易，返回签名后的原始字节。
 
-# -------------------------- 4. 提交交易到Solana网络 --------------------------
-def submit_transaction(signed_tx_base64):
-    """提交签名后的交易到Solana网络，返回交易ID"""
+    这里使用 solders.transaction.Transaction + solders.keypair.Keypair 完成签名，
+    避免依赖 solana.transaction / solana.keypair。"""
+
     try:
-        # 提交交易（使用solana-web3.py客户端）
-        response = SOLANA_CLIENT.send_raw_transaction(signed_tx_base64)
-        tx_id = response.value
-        print(f"交易提交成功！交易ID：{tx_id}")
-        print(f"交易详情可查看：https://solscan.io/tx/{tx_id}?cluster=devnet")  # 测试网地址，主网替换为cluster=mainnet
-        return tx_id
-    except Exception as e:
-        print(f"提交交易出错：{str(e)}")
+        tx_data = base64.b64decode(swap_tx_base64)
+        transaction = LegacyTransaction.from_bytes(tx_data)
+        # solders 的 Transaction.sign 接受 Keypair 列表
+        signed_tx = transaction.sign([user_keypair])
+        logger.debug("Legacy 交易签名完成，长度=%d 字节", len(bytes(signed_tx)))
+        return bytes(signed_tx)
+    except Exception as e:  # noqa: BLE001
+        logger.error("Legacy 交易签名失败: %s", e)
+        logger.debug("Legacy 签名异常堆栈:\n%s", traceback.format_exc())
         raise
 
-# -------------------------- 5. 执行完整交易流程 --------------------------
-def exec_legacy_tx():
+
+
+# -------------------------- 4. 提交交易到 Solana 网络 --------------------------
+def legacy_submit_transaction(client: Client, signed_tx: bytes, logger: logging.Logger) -> str:
+    """提交签名后的交易到 Solana 网络，返回交易签名。"""
+
     try:
-        print("=== 开始执行带priorityFee的Swap交易 ===")
-        # 1. 获取交易指令
-        swap_tx_base64 = get_swap_transaction()
-        print("✅ 成功获取交易指令")
-        # 2. 签名交易
-        signed_tx_base64 = sign_transaction(swap_tx_base64)
-        print("✅ 成功签名交易")
-        # 3. 提交交易
-        tx_id = submit_transaction(signed_tx_base64)
-    except Exception as e:
-        print(f"❌ 交易执行失败：{str(e)}")
+        response = client.send_raw_transaction(signed_tx)
+        tx_id = str(response.value)
+        logger.info("Legacy Swap 交易已发送: %s", tx_id)
+        logger.info("Solscan: https://solscan.io/tx/%s", tx_id)
+        return tx_id
+    except Exception as e:  # noqa: BLE001
+        logger.error("提交 Legacy 交易失败: %s", e)
+        logger.debug("Legacy 提交异常堆栈:\n%s", traceback.format_exc())
+        raise
+
+
+# -------------------------- 5. 执行完整 Legacy 交易流程 --------------------------
+def exec_legacy_tx(
+    client: Client,
+    keypair: Keypair,
+    cfg: AppConfig,
+    logger: logging.Logger,
+    tx_logger: logging.Logger,
+) -> tuple[bool, dict, Optional[str]]:
+    """使用 Jupiter Legacy API 执行一对交易: SOL -> USDC -> SOL。
+
+    - 第 1 步: 使用 Legacy Swap 将随机数量的 SOL 换成 USDC
+    - 第 2 步: 使用 Legacy Swap 将当前钱包中全部 USDC 换回 SOL
+    - 统计字段与 Ultra 模式保持一致: sol_spent_lamports / usdc_received_units /
+      usdc_spent_units / sol_bought_lamports
+    """
+
+    base_empty_stats = {
+        "sol_spent_lamports": 0,
+        "usdc_received_units": 0,
+        "usdc_spent_units": 0,
+        "sol_bought_lamports": 0,
+    }
+
+    # 每轮一对交易内部使用的统计对象
+    stats = base_empty_stats.copy()
+
+    try:
+        # 为本轮 Legacy 一对交易随机选择 SOL 数量（单位：SOL）
+        trade_amount_sol = random_trade_amount_sol(cfg)
+        trade_amount_sol_display = trade_amount_sol
+        amount_lamports = int(trade_amount_sol * 1_000_000_000)
+        if amount_lamports <= 0:
+            error_reason = (
+                f"Legacy 一对交易金额无效: amount_sol={trade_amount_sol}, amount_lamports={amount_lamports}"
+            )
+            logger.error(error_reason)
+            return False, stats, error_reason
+
+        # 从 Base58 私钥构造 solders-keypair，并得到钱包地址
+        secret_stripped = cfg.private_key.strip()
+        user_keypair = Keypair.from_base58_string(secret_stripped)
+        user_pubkey = str(user_keypair.pubkey())
+
+
+        logger.info(
+            "开始执行 Legacy 一对交易: 第 1 步 SOL->USDC, 第 2 步 USDC->SOL; amount_sol=%.9f amount_lamports=%d slippage_bps=%s priority_fee=%s",
+            trade_amount_sol_display,
+            amount_lamports,
+            cfg.slippage_bps,
+            cfg.priority_fee,
+        )
+
+        # 一对交易前余额快照
+        try:
+            sol_before, usdc_before = get_wallet_balances(
+                client,
+                user_pubkey,
+                USDC_MINT,
+                logger,
+                cfg.rpc_url,
+                cfg.retry_max_attempts,
+                cfg.retry_sleep_s,
+            )
+            tx_logger.info(
+                "余额快照 阶段=legacy_before 钱包_SOL_lamports=%d 钱包_SOL=%.9f 钱包_USDC_units=%d 钱包_USDC=%.6f",
+                sol_before,
+                sol_before / 1_000_000_000,
+                usdc_before,
+                usdc_before / 1_000_000,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.error("获取 Legacy 一对交易开始前钱包余额失败: %s", e)
+
+        # ==================== 第 1 步: SOL -> USDC ====================
+        logger.info(
+            "Legacy 一对交易-第 1 步: 准备将本次随机选取的 %.9f SOL 换为 USDC...",
+            trade_amount_sol_display,
+        )
+
+        # 1. 获取 SOL->USDC 交易指令
+        swap_tx_base64_1, quote1 = legacy_get_swap_transaction(
+            cfg,
+            logger,
+            SOL_MINT,
+            USDC_MINT,
+            amount_lamports,
+            user_pubkey,
+        )
+
+        logger.info("Legacy 第 1 步获取 SOL->USDC 交易指令成功")
+
+        # 解析报价信息，用于统计 "预计获得" 的 USDC 数量
+        try:
+            usdc_out_units_est = int(quote1.get("outputAmount", "0"))
+        except Exception:  # noqa: BLE001
+            usdc_out_units_est = 0
+
+        if usdc_out_units_est <= 0:
+            error_reason = (
+                f"Legacy SOL->USDC 报价返回的 outputAmount 无效: {quote1.get('outputAmount')}"
+            )
+            logger.error("%s, 完整响应: %s", error_reason, quote1)
+            return False, stats, error_reason
+
+        # 更新统计: 第 1 步花费 SOL, 预计获得 USDC
+        stats["sol_spent_lamports"] = amount_lamports
+        stats["usdc_received_units"] = usdc_out_units_est
+
+        # 2. 签名第 1 步交易
+        signed_tx1 = legacy_sign_transaction(swap_tx_base64_1, user_keypair, logger)
+        logger.info("Legacy 第 1 步 SOL->USDC 交易签名成功")
+
+        # 3. 提交第 1 步交易
+        tx_id1 = legacy_submit_transaction(client, signed_tx1, logger)
+
+        # 等待第 1 步链上确认
+        confirm_timeout = max(cfg.tx_interval_s, 20)
+        logger.info(
+            "Legacy 第 1 步 SOL->USDC 交易已提交, 开始等待最多 %d 秒以确认链上状态...",
+            confirm_timeout,
+        )
+
+        if not wait_for_transaction_confirmation(
+            client=client,
+            signature=tx_id1,
+            logger=logger,
+            rpc_url=cfg.rpc_url,
+            timeout_s=confirm_timeout,
+            poll_interval_s=2,
+        ):
+            error_reason = (
+                f"Legacy SOL->USDC 交易 {tx_id1} 在 {confirm_timeout} 秒内未确认或确认失败。"
+            )
+            return False, stats, error_reason
+
+        # 第 1 步完成后的余额快照, 用于确认 USDC 实际到账情况
+        try:
+            sol_after_leg1, usdc_after_leg1 = get_wallet_balances(
+                client,
+                user_pubkey,
+                USDC_MINT,
+                logger,
+                cfg.rpc_url,
+                cfg.retry_max_attempts,
+                cfg.retry_sleep_s,
+            )
+            tx_logger.info(
+                "余额快照 阶段=legacy_leg1_after 钱包_SOL_lamports=%d 钱包_SOL=%.9f 钱包_USDC_units=%d 钱包_USDC=%.6f",
+                sol_after_leg1,
+                sol_after_leg1 / 1_000_000_000,
+                usdc_after_leg1,
+                usdc_after_leg1 / 1_000_000,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.error("获取 Legacy 第 1 步完成后钱包余额失败: %s", e)
+            error_reason = f"获取 Legacy 第 1 步完成后钱包余额失败: {e}"
+            return False, stats, error_reason
+
+        if usdc_after_leg1 <= 0:
+            error_reason = (
+                "Legacy 第 1 步后 USDC 余额小于等于 0, 无法执行后续 USDC->SOL 交易。"
+            )
+            logger.error(error_reason)
+            return False, stats, error_reason
+
+        # 第 2 步将使用当前钱包中全部 USDC 余额作为输入
+        effective_usdc_amount = usdc_after_leg1
+        stats["usdc_spent_units"] = effective_usdc_amount
+
+        # 记录第 1 步交易明细日志
+        tx_logger.info(
+            (
+                "legacy_step=1 type=SOL_TO_USDC "
+                "input_mint=%s output_mint=%s "
+                "amount_sol=%.9f amount_lamports=%d "
+                "expected_out_usdc_units=%d inputAmount=%s outputAmount=%s priorityFee=%s "
+                "signature=%s"
+            ),
+            SOL_MINT,
+            USDC_MINT,
+            trade_amount_sol_display,
+            amount_lamports,
+            usdc_out_units_est,
+            quote1.get("inputAmount"),
+            quote1.get("outputAmount"),
+            quote1.get("priorityFee"),
+            tx_id1,
+        )
+
+        # ==================== 第 2 步: USDC -> SOL ====================
+        logger.info("Legacy 一对交易-第 2 步: 准备将当前 USDC 换回 SOL...")
+
+        # 4. 获取 USDC->SOL 交易指令
+        swap_tx_base64_2, quote2 = legacy_get_swap_transaction(
+            cfg,
+            logger,
+            USDC_MINT,
+            SOL_MINT,
+            effective_usdc_amount,
+            user_pubkey,
+        )
+
+        logger.info("Legacy 第 2 步获取 USDC->SOL 交易指令成功")
+
+        # 解析报价信息, 用于统计 "预计买回" 的 SOL 数量
+        try:
+            sol_out_lamports_est = int(quote2.get("outputAmount", "0"))
+        except Exception:  # noqa: BLE001
+            sol_out_lamports_est = 0
+
+        if sol_out_lamports_est <= 0:
+            error_reason = (
+                f"Legacy USDC->SOL 报价返回的 outputAmount 无效: {quote2.get('outputAmount')}"
+            )
+            logger.error("%s, 完整响应: %s", error_reason, quote2)
+            return False, stats, error_reason
+
+        # 更新统计: 第 2 步买回的 SOL 数量
+        stats["sol_bought_lamports"] = sol_out_lamports_est
+
+        # 5. 签名第 2 步交易
+        signed_tx2 = legacy_sign_transaction(swap_tx_base64_2, user_keypair, logger)
+        logger.info("Legacy 第 2 步 USDC->SOL 交易签名成功")
+
+        # 6. 提交第 2 步交易
+        tx_id2 = legacy_submit_transaction(client, signed_tx2, logger)
+
+        logger.info(
+            "Legacy 第 2 步 USDC->SOL 交易已提交, 开始等待最多 %d 秒以确认链上状态...",
+            confirm_timeout,
+        )
+
+        if not wait_for_transaction_confirmation(
+            client=client,
+            signature=tx_id2,
+            logger=logger,
+            rpc_url=cfg.rpc_url,
+            timeout_s=confirm_timeout,
+            poll_interval_s=2,
+        ):
+            error_reason = (
+                f"Legacy USDC->SOL 交易 {tx_id2} 在 {confirm_timeout} 秒内未确认或确认失败。"
+            )
+            return False, stats, error_reason
+
+        # 一对交易完成后的余额快照
+        try:
+            sol_after_pair, usdc_after_pair = get_wallet_balances(
+                client,
+                user_pubkey,
+                USDC_MINT,
+                logger,
+                cfg.rpc_url,
+                cfg.retry_max_attempts,
+                cfg.retry_sleep_s,
+            )
+            tx_logger.info(
+                "余额快照 阶段=legacy_pair_after 钱包_SOL_lamports=%d 钱包_SOL=%.9f 钱包_USDC_units=%d 钱包_USDC=%.6f",
+                sol_after_pair,
+                sol_after_pair / 1_000_000_000,
+                usdc_after_pair,
+                usdc_after_pair / 1_000_000,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.error("获取 Legacy 一对交易完成后钱包余额失败: %s", e)
+
+        # 记录第 2 步交易明细日志
+        tx_logger.info(
+            (
+                "legacy_step=2 type=USDC_TO_SOL "
+                "input_mint=%s output_mint=%s "
+                "amount_usdc_units=%d amount_usdc=%.6f "
+                "expected_out_sol_lamports=%d expected_out_sol=%.9f "
+                "inputAmount=%s outputAmount=%s priorityFee=%s "
+                "signature=%s"
+            ),
+            USDC_MINT,
+            SOL_MINT,
+            effective_usdc_amount,
+            effective_usdc_amount / 1_000_000,
+            sol_out_lamports_est,
+            sol_out_lamports_est / 1_000_000_000,
+            quote2.get("inputAmount"),
+            quote2.get("outputAmount"),
+            quote2.get("priorityFee"),
+            tx_id2,
+        )
+
+        # Legacy 一对交易级别的汇总日志
+        net_sol_lamports = stats["sol_bought_lamports"] - stats["sol_spent_lamports"]
+        net_sol = net_sol_lamports / 1_000_000_000
+        tx_logger.info(
+            "legacy_pair_summary sol_in_lamports=%d usdc_out_units=%d usdc_spent_units=%d sol_out_lamports=%d net_sol_change_lamports=%d net_sol_change=%.9f",
+            stats["sol_spent_lamports"],
+            stats["usdc_received_units"],
+            stats["usdc_spent_units"],
+            stats["sol_bought_lamports"],
+            net_sol_lamports,
+            net_sol,
+        )
+
+        return True, stats, None
+    except Exception as e:  # noqa: BLE001
+        error_reason = f"Legacy 一对交易执行失败: {e}"
+        logger.error(error_reason)
+        logger.debug("Legacy 一对交易执行异常堆栈:\n%s", traceback.format_exc())
+        return False, stats, error_reason
+
+
+
 
 @dataclass
 class AppConfig:
@@ -183,6 +545,11 @@ class AppConfig:
     # enable_referral: bool  # 是否启用 Referral 功能（包括使用 referral_fee 以及创建/获取 referral 账户）
     retry_max_attempts: int  # 外部 HTTP/RPC 调用的最大重试次数
     retry_sleep_s: int  # 外部 HTTP/RPC 重试间隔秒数
+    slippage_bps: int  # Legacy Swap 使用的滑点（单位：bps）
+    priority_fee: int  # Legacy Swap 使用的优先费（单位：lamports）
+    legacy_mode: bool  # 是否启用 Legacy 单笔 Swap 模式
+
+
 
 
 
@@ -322,6 +689,11 @@ def load_config(path: str) -> AppConfig:
     retry_max_attempts = int(raw.get("retry_max_attempts", 10))
     retry_sleep_s = int(raw.get("retry_sleep_s", 2))
 
+    # Legacy Swap 相关配置（用于 priority_fee / slippage）
+    slippage_bps = int(raw.get("slippage_bps", 0))
+    priority_fee = int(raw.get("priority_fee", 0))
+    legacy_mode = bool(raw.get("legacy_mode", False))
+
     cfg = AppConfig(
 
         network=network,
@@ -339,10 +711,22 @@ def load_config(path: str) -> AppConfig:
         # enable_referral=enable_referral,
         retry_max_attempts=retry_max_attempts,
         retry_sleep_s=retry_sleep_s,
+        slippage_bps=slippage_bps,
+        priority_fee=priority_fee,
+        legacy_mode=legacy_mode,
     )
+
+
 
     return cfg
 
+
+
+def random_trade_amount_sol(cfg: AppConfig) -> float:
+    """在 trade_amount_min / trade_amount_max 范围内随机选择本次交易的 SOL 数量（单位：SOL）。"""
+    trade_amount_sol_raw = random.uniform(cfg.trade_amount_min, cfg.trade_amount_max)
+    trade_amount_sol = round(trade_amount_sol_raw, 3)
+    return trade_amount_sol
 
 
 def _execute_trade_pair_once(
@@ -401,13 +785,13 @@ def _execute_trade_pair_once(
     wallet_pubkey = str(keypair.pubkey())
 
     # 为本次一对交易随机生成 SOL 卖出数量（单位：SOL），只保留 3 位小数
-    trade_amount_sol_raw = random.uniform(cfg.trade_amount_min, cfg.trade_amount_max)
-    trade_amount_sol = round(trade_amount_sol_raw, 3)
+    trade_amount_sol = random_trade_amount_sol(cfg)
     # 日志展示同样保留 3 位小数
     trade_amount_sol_display = trade_amount_sol
 
 
     amount_sol_lamports = int(trade_amount_sol * 1_000_000_000)
+
     if amount_sol_lamports <= 0:
         logger.error(
             "根据 trade_amount 范围 [%.9f, %.9f] 随机得到的本次 SOL 数量=%.9f, "
@@ -453,16 +837,6 @@ def _execute_trade_pair_once(
     stats["usdc_spent_units"] = effective_usdc_amount
 
     # -------- 第一步: SOL -> USDC -------- 已在 _execute_first_leg 中完成
-
-
-
-
-
-
-
-
-
-
     # 以实际可用的 USDC 数量作为本次 USDC->SOL 的输入
     stats["usdc_spent_units"] = effective_usdc_amount
 
@@ -488,9 +862,6 @@ def _execute_trade_pair_once(
     logger.info("一对交易全部完成！")
     return True, stats, None
 
-
-
-
 def load_keypair_from_base58(secret: str) -> Keypair:
     """从 Base58 编码的私钥字符串创建 Keypair。
 
@@ -505,8 +876,6 @@ def load_keypair_from_base58(secret: str) -> Keypair:
         raise ValueError(
             "私钥格式错误：请确认是 Base58 编码的 Solana 私钥字符串，且不要包含多余空格或换行。"
         ) from e
-
-
 
 def build_client(cfg: AppConfig) -> Client:
     """根据配置创建 Solana RPC 客户端。"""
@@ -563,45 +932,36 @@ def get_usdc_balance(
             # 无法获得 RPC 地址，只能把异常抛出去
             raise
 
-        # 退回到直接使用 JSON-RPC 请求，并增加重试机制
-        last_exception: Optional[Exception] = None
-        for attempt in range(1, retry_max_attempts + 1):
+        # 退回到直接使用 JSON-RPC 请求，并增加重试机制（使用通用 HTTP 重试封装）
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getTokenAccountsByOwner",
+            "params": [
+                owner_pubkey,
+                {"mint": usdc_mint},
+                {"encoding": "jsonParsed"},
+            ],
+        }
 
-            try:
-                payload = {
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "getTokenAccountsByOwner",
-                    "params": [
-                        owner_pubkey,
-                        {"mint": usdc_mint},
-                        {"encoding": "jsonParsed"},
-                    ],
-                }
-                http_resp = requests.post(rpc_url, json=payload, timeout=20)
-                http_resp.raise_for_status()
-                data = http_resp.json()
+        http_resp = http_request_with_retry(
+            cfg=None,
+            logger=logger,
+            label="使用原始 RPC 请求获取 USDC 余额",
+            method="POST",
+            url=rpc_url,
+            headers={"Content-Type": "application/json"},
+            json_body=payload,
+            timeout=20,
+            treat_insufficient_as_fatal=False,
+            max_attempts=retry_max_attempts,
+            sleep_s=retry_sleep_s,
+        )
+        data = http_resp.json()
 
-                result = data.get("result", {})
-                value = result.get("value", [])
-                last_exception = None
-                break
-            except Exception as e2:  # noqa: BLE001
-                last_exception = e2
-                if attempt >= retry_max_attempts:
-                    logger.error(
-                        "使用原始 RPC 请求获取 USDC 余额失败(已重试 %d 次): %s",
-                        attempt,
-                        e2,
-                    )
-                    raise
-                logger.warning(
-                    "使用原始 RPC 请求获取 USDC 余额失败(尝试 %d/%d): %s",
-                    attempt,
-                    retry_max_attempts,
-                    e2,
-                )
-                time.sleep(retry_sleep_s)
+        result = data.get("result", {})
+        value = result.get("value", [])
+
 
 
 
@@ -988,39 +1348,30 @@ def get_wallet_balances(
             # 无法获得 RPC 地址，只能把异常抛出去
             raise
 
-        # 使用原始 JSON-RPC 调用作为兜底，并增加重试机制
-        last_exception: Optional[Exception] = None
-        for attempt in range(1, retry_max_attempts + 1):
+        # 使用原始 JSON-RPC 调用作为兜底，并增加重试机制（使用通用 HTTP 重试封装）
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getBalance",
+            "params": [owner_pubkey, {"commitment": "processed"}],
+        }
 
-            try:
-                payload = {
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "getBalance",
-                    "params": [owner_pubkey, {"commitment": "processed"}],
-                }
-                http_resp = requests.post(rpc_url, json=payload, timeout=20)
-                http_resp.raise_for_status()
-                data = http_resp.json()
-                sol_lamports = int(data.get("result", {}).get("value", 0))
-                last_exception = None
-                break
-            except Exception as e2:  # noqa: BLE001
-                last_exception = e2
-                if attempt >= retry_max_attempts:
-                    logger.error(
-                        "使用原始 RPC 请求获取 SOL 余额失败(已重试 %d 次): %s",
-                        attempt,
-                        e2,
-                    )
-                    raise
-                logger.warning(
-                    "使用原始 RPC 请求获取 SOL 余额失败(尝试 %d/%d): %s",
-                    attempt,
-                    retry_max_attempts,
-                    e2,
-                )
-                time.sleep(retry_sleep_s)
+        http_resp = http_request_with_retry(
+            cfg=None,
+            logger=logger,
+            label="使用原始 RPC 请求获取 SOL 余额",
+            method="POST",
+            url=rpc_url,
+            headers={"Content-Type": "application/json"},
+            json_body=payload,
+            timeout=20,
+            treat_insufficient_as_fatal=False,
+            max_attempts=retry_max_attempts,
+            sleep_s=retry_sleep_s,
+        )
+        data = http_resp.json()
+        sol_lamports = int(data.get("result", {}).get("value", 0))
+
 
 
 
@@ -1127,6 +1478,135 @@ def wait_for_transaction_confirmation(
 
 
 
+
+
+
+def http_request_with_retry(
+    cfg: Optional[AppConfig],
+    logger: logging.Logger,
+    label: str,
+    method: str,
+    url: str,
+    *,
+    session: Optional[requests.Session] = None,
+    headers: Optional[dict] = None,
+    json_body: Optional[dict] = None,
+    timeout: int = 30,
+    treat_insufficient_as_fatal: bool = False,
+    max_attempts: Optional[int] = None,
+    sleep_s: Optional[float] = None,
+    response_hook: Optional[Callable[[requests.Response, int, int], None]] = None,
+) -> requests.Response:
+
+    """通用 HTTP 请求重试封装。
+
+    - 不关注具体业务，只处理: 重试、超时、HTTP 状态码、余额不足等通用模式
+    - 具体的 JSON 解析和字段校验由调用方负责
+    - 可选 response_hook: 每次非 200 响应时调用, 便于业务层输出更细日志
+    """
+
+    if cfg is None and (max_attempts is None or sleep_s is None):
+        raise ValueError("http_request_with_retry 需要 cfg 或显式提供 max_attempts 和 sleep_s。")
+
+    if max_attempts is None:
+        max_attempts = cfg.retry_max_attempts  # type: ignore[union-attr]
+    if sleep_s is None:
+        sleep_s = cfg.retry_sleep_s  # type: ignore[union-attr]
+
+
+    resp: Optional[requests.Response] = None
+    last_resp_text = ""
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            if session is not None:
+                resp = session.request(
+                    method=method,
+                    url=url,
+                    headers=headers,
+                    json=json_body,
+                    timeout=timeout,
+                )
+            else:
+                resp = requests.request(
+                    method=method,
+                    url=url,
+                    headers=headers,
+                    json=json_body,
+                    timeout=timeout,
+                )
+        except Exception as e:  # noqa: BLE001
+            if attempt >= max_attempts:
+                logger.error("%s失败(已重试 %d 次, 请求异常): %s", label, attempt, e)
+                raise RuntimeError(f"{label}失败(请求异常): {e}") from e
+
+            logger.warning(
+                "%s失败(尝试 %d/%d, 请求异常): %s",
+                label,
+                attempt,
+                max_attempts,
+                e,
+            )
+        else:
+            if resp.status_code == 200:
+                return resp
+
+            last_resp_text = resp.text or ""
+
+            # 允许业务层在非 200 响应时做额外处理/日志
+            if response_hook is not None:
+                try:
+                    response_hook(resp, attempt, max_attempts)
+                except Exception as hook_e:  # noqa: BLE001
+                    logger.warning(
+                        "%s 的 response_hook 执行异常(尝试 %d/%d): %s",
+                        label,
+                        attempt,
+                        max_attempts,
+                        hook_e,
+                    )
+
+            # 余额不足类错误视为致命错误，立即终止，不再重试
+            if treat_insufficient_as_fatal:
+                lower_msg = last_resp_text.lower()
+                if ("insufficient" in lower_msg and "fund" in lower_msg) or (
+                    "余额不足" in last_resp_text
+                ):
+                    logger.error("%s失败，检测到可能的余额不足: %s", label, last_resp_text)
+                    raise RuntimeError(f"{label}失败：余额不足或资金不足。")
+
+            if attempt >= max_attempts:
+                logger.error(
+                    "%s失败(已重试 %d 次), HTTP %d: %s",
+                    label,
+                    attempt,
+                    resp.status_code,
+                    last_resp_text,
+                )
+                raise RuntimeError(
+                    f"{label}失败, HTTP {resp.status_code}: {last_resp_text}"
+                )
+
+            logger.warning(
+                "%s失败(尝试 %d/%d), HTTP %d: %s",
+                label,
+                attempt,
+                max_attempts,
+                resp.status_code,
+                last_resp_text,
+            )
+
+        if attempt < max_attempts:
+            time.sleep(sleep_s)
+
+    # 理论上不会到这里，防御性处理
+    raise RuntimeError(
+        f"{label}失败, HTTP {getattr(resp, 'status_code', '未知')}: {last_resp_text}"
+    )
+
+
+
+
 def _send_signed_tx_via_ultra_execute(
     cfg: AppConfig,
     logger: logging.Logger,
@@ -1139,103 +1619,50 @@ def _send_signed_tx_via_ultra_execute(
 ) -> tuple[bool, Optional[dict], Optional[str]]:
     """发送已签名的交易到 Jupiter Ultra /execute, 带重试与余额不足检测。
 
-    仅抽取重复结构, 不改变原有业务行为。
+    重试与余额不足检测通过 http_request_with_retry 统一处理。
+    enable_decode_retry 目前仅用于额外日志提示, 不改变重试策略。
     """
 
     execute_url = f"{JUPITER_ULTRA_API_BASE}/execute"
 
-    max_attempts = cfg.retry_max_attempts
-    last_resp_text = ""
-
-    resp = None
     headers = {
         "Content-Type": "application/json",
         "x-api-key": ULTRA_API_KEY,
     }
-    for attempt in range(1, max_attempts + 1):
-        try:
-            resp = http_session.post(
-                execute_url,
-                json=execute_payload,
-                headers=headers,
-                timeout=timeout,
-            )
-        except Exception as e:  # noqa: BLE001
-            if attempt >= max_attempts:
-                logger.error(
-                    "执行 %s 交易请求失败(已重试 %d 次): %s",
-                    trade_label,
-                    attempt,
-                    e,
-                )
-                error_reason = f"执行 {trade_label} 交易失败(请求异常): {e}"
-                return False, None, error_reason
-            logger.warning(
-                "执行 %s 交易请求失败(尝试 %d/%d): %s",
-                trade_label,
-                attempt,
-                max_attempts,
-                e,
-            )
-        else:
-            if resp.status_code == 200:
-                break
 
-            last_resp_text = resp.text or ""
-            err_msg = last_resp_text
-
-            lower_msg = err_msg.lower()
-            if ("insufficient" in lower_msg and "fund" in lower_msg) or (
-                "余额不足" in err_msg
-            ):
-                logger.error(
-                    "执行 %s 交易失败，检测到可能的 %s 余额不足: %s",
-                    trade_label,
-                    insufficient_token_name,
-                    err_msg,
-                )
-                error_reason = (
-                    f"执行 {trade_label} 交易失败：{insufficient_token_name} 余额不足或资金不足。"
-                )
-                return False, None, error_reason
-
-            logger.error(
-                "执行 %s 交易失败(尝试 %d/%d), HTTP %d: %s",
-                trade_label,
-                attempt,
-                max_attempts,
-                resp.status_code,
-                err_msg,
-            )
-
-            if (
-                enable_decode_retry
-                and resp.status_code == 400
-                and "Failed to decode signed transaction" in err_msg
-                and attempt < max_attempts
-            ):
-                logger.warning(
-                    "检测到 Ultra 返回 'Failed to decode signed transaction', 准备重试 %s execute...",
-                    trade_label,
-                )
-            else:
-                if attempt >= max_attempts:
-                    error_reason = (
-                        f"执行 {trade_label} 交易失败, HTTP {resp.status_code}: {err_msg}"
-                    )
-                    return False, None, error_reason
-
-        if attempt < max_attempts:
-            time.sleep(cfg.retry_sleep_s)
-
-    if resp is None or resp.status_code != 200:
-        error_reason = (
-            f"执行 {trade_label} 交易失败, HTTP {getattr(resp, 'status_code', '未知')}: {last_resp_text}"
+    try:
+        resp = http_request_with_retry(
+            cfg=cfg,
+            logger=logger,
+            label=f"执行 {trade_label} 交易({insufficient_token_name})",
+            method="POST",
+            url=execute_url,
+            session=http_session,
+            headers=headers,
+            json_body=execute_payload,
+            timeout=timeout,
+            treat_insufficient_as_fatal=True,
         )
+    except Exception as e:  # noqa: BLE001
+        # 对于 decode 相关错误, 仅额外输出一条日志, 实际重试行为由 http_request_with_retry 控制
+        msg = str(e)
+        if enable_decode_retry and "Failed to decode signed transaction" in msg:
+            logger.warning(
+                "检测到 Ultra 返回 'Failed to decode signed transaction' 相关错误, 已按重试策略执行: %s",
+                msg,
+            )
+        error_reason = f"执行 {trade_label} 交易失败: {e}"
         return False, None, error_reason
 
-    exec_result = resp.json()
+    try:
+        exec_result = resp.json()
+    except Exception as e:  # noqa: BLE001
+        logger.error("解析 %s execute 响应 JSON 失败: %s, 原始响应: %s", trade_label, e, resp.text)
+        error_reason = f"执行 {trade_label} 交易失败: 无法解析节点响应 JSON: {e}"
+        return False, None, error_reason
+
     return True, exec_result, None
+
 
 
 
@@ -1304,71 +1731,18 @@ def _execute_first_leg(
         logger.debug("请求 SOL->USDC 订单: %s", order_url)
 
         headers = {"x-api-key": ULTRA_API_KEY}
-        max_attempts = cfg.retry_max_attempts
 
-        resp = None
-        last_resp_text = ""
-        for attempt in range(1, max_attempts + 1):
-            try:
-                resp = http_session.get(order_url, headers=headers, timeout=timeout)
-            except Exception as e:  # noqa: BLE001
-                if attempt >= max_attempts:
-                    logger.error(
-                        "获取 SOL->USDC 订单失败(已重试 %d 次, 请求异常): %s",
-                        attempt,
-                        e,
-                    )
-                    error_reason = f"获取 SOL->USDC 订单失败(请求异常): {e}"
-                    return False, stats, error_reason, None
-                logger.warning(
-                    "获取 SOL->USDC 订单失败(尝试 %d/%d, 请求异常): %s",
-                    attempt,
-                    max_attempts,
-                    e,
-                )
-            else:
-                if resp.status_code == 200:
-                    break
-
-                last_resp_text = resp.text or ""
-                lower_msg = last_resp_text.lower()
-                if ("insufficient" in lower_msg and "fund" in lower_msg) or (
-                    "余额不足" in last_resp_text
-                ):
-                    logger.error(
-                        "获取 SOL->USDC 订单失败，检测到可能的 SOL 余额不足: %s",
-                        last_resp_text,
-                    )
-                    error_reason = "SOL 余额不足，无法创建 SOL->USDC 订单。"
-                    return False, stats, error_reason, None
-
-                if attempt >= max_attempts:
-                    logger.error(
-                        "获取 SOL->USDC 订单失败(已重试 %d 次), HTTP %d: %s",
-                        attempt,
-                        resp.status_code,
-                        last_resp_text,
-                    )
-                    error_reason = (
-                        f"获取 SOL->USDC 订单失败, HTTP {resp.status_code}: {last_resp_text}"
-                    )
-                    return False, stats, error_reason, None
-
-                logger.warning(
-                    "获取 SOL->USDC 订单失败(尝试 %d/%d), HTTP %d: %s",
-                    attempt,
-                    max_attempts,
-                    resp.status_code,
-                    last_resp_text,
-                )
-
-            time.sleep(2)
-
-        if resp is None or resp.status_code != 200:
-            error_reason = (
-                f"获取 SOL->USDC 订单失败, HTTP {getattr(resp, 'status_code', '未知')}: {last_resp_text}"
-            )
-            return False, stats, error_reason, None
+        resp = http_request_with_retry(
+            cfg=cfg,
+            logger=logger,
+            label="获取 SOL->USDC 订单",
+            method="GET",
+            url=order_url,
+            session=http_session,
+            headers=headers,
+            timeout=timeout,
+            treat_insufficient_as_fatal=True,
+        )
 
         order1 = resp.json()
     except Exception as e:  # noqa: BLE001
@@ -1376,6 +1750,7 @@ def _execute_first_leg(
         logger.debug("SOL->USDC 订单异常堆栈:\n%s", traceback.format_exc())
         error_reason = f"获取 SOL->USDC 订单失败: {e}"
         return False, stats, error_reason, None
+
 
     out_usdc_amount = int(order1.get("outAmount", 0))
     if out_usdc_amount <= 0:
@@ -1602,71 +1977,18 @@ def _execute_second_leg(
         logger.debug("请求 USDC->SOL 订单: %s", order_url2)
 
         headers = {"x-api-key": ULTRA_API_KEY}
-        max_attempts = cfg.retry_max_attempts
 
-        resp = None
-        last_resp_text = ""
-        for attempt in range(1, max_attempts + 1):
-            try:
-                resp = http_session.get(order_url2, headers=headers, timeout=timeout)
-            except Exception as e:  # noqa: BLE001
-                if attempt >= max_attempts:
-                    logger.error(
-                        "获取 USDC->SOL 订单失败(已重试 %d 次, 请求异常): %s",
-                        attempt,
-                        e,
-                    )
-                    error_reason = f"获取 USDC->SOL 订单失败(请求异常): {e}"
-                    return False, stats, error_reason
-                logger.warning(
-                    "获取 USDC->SOL 订单失败(尝试 %d/%d, 请求异常): %s",
-                    attempt,
-                    max_attempts,
-                    e,
-                )
-            else:
-                if resp.status_code == 200:
-                    break
-
-                last_resp_text = resp.text or ""
-                lower_msg = last_resp_text.lower()
-                if ("insufficient" in lower_msg and "fund" in lower_msg) or (
-                    "余额不足" in last_resp_text
-                ):
-                    logger.error(
-                        "获取 USDC->SOL 订单失败，检测到可能的 USDC 余额不足: %s",
-                        last_resp_text,
-                    )
-                    error_reason = "USDC 余额不足，无法创建 USDC->SOL 订单。"
-                    return False, stats, error_reason
-
-                if attempt >= max_attempts:
-                    logger.error(
-                        "获取 USDC->SOL 订单失败(已重试 %d 次), HTTP %d: %s",
-                        attempt,
-                        resp.status_code,
-                        last_resp_text,
-                    )
-                    error_reason = (
-                        f"获取 USDC->SOL 订单失败, HTTP {resp.status_code}: {last_resp_text}"
-                    )
-                    return False, stats, error_reason
-
-                logger.warning(
-                    "获取 USDC->SOL 订单失败(尝试 %d/%d), HTTP %d: %s",
-                    attempt,
-                    max_attempts,
-                    resp.status_code,
-                    last_resp_text,
-                )
-
-            time.sleep(2)
-
-        if resp is None or resp.status_code != 200:
-            error_reason = (
-                f"获取 USDC->SOL 订单失败, HTTP {getattr(resp, 'status_code', '未知')}: {last_resp_text}"
-            )
-            return False, stats, error_reason
+        resp = http_request_with_retry(
+            cfg=cfg,
+            logger=logger,
+            label="获取 USDC->SOL 订单",
+            method="GET",
+            url=order_url2,
+            session=http_session,
+            headers=headers,
+            timeout=timeout,
+            treat_insufficient_as_fatal=True,
+        )
 
         order2 = resp.json()
 
@@ -1675,6 +1997,7 @@ def _execute_second_leg(
         logger.debug("USDC->SOL 订单异常堆栈:\n%s", traceback.format_exc())
         error_reason = f"获取 USDC->SOL 订单失败: {e}"
         return False, stats, error_reason
+
 
     out_sol_lamports = int(order2.get("outAmount", 0))
     if out_sol_lamports <= 0:
@@ -1853,6 +2176,260 @@ def execute_trade_pair(
 
 
 
+
+
+
+def run_trading_loop(
+    cfg: AppConfig,
+    client: Client,
+    keypair: Keypair,
+    logger: logging.Logger,
+    tx_logger: logging.Logger,
+    wallet_pubkey: str,
+    mode: str,
+    execute_round_fn,
+) -> None:
+    """通用自动交易循环。
+
+    - Ultra 模式: execute_round_fn=execute_trade_pair, 每轮执行一对交易 (SOL->USDC->SOL)
+    - Legacy 模式: execute_round_fn=exec_legacy_tx, 每轮执行一笔 Legacy Swap (SOL->USDC)
+    """
+
+    if mode == "ultra":
+        logger.info(
+            '开始进入自动交易循环，每一轮都会执行"一对交易" (SOL->USDC->SOL)，按 Ctrl + C 可手动停止程序。'
+        )
+    else:
+        logger.info(
+            '开始进入自动交易循环，每一轮都会执行 Legacy 一对交易 (SOL->USDC->SOL)，按 Ctrl + C 可手动停止程序。'
+        )
+
+    success_pairs = 0
+
+    # 文案标签：Ultra 使用“一对交易”，Legacy 使用“Legacy 一对交易”
+    unit_label = "一对交易" if mode == "ultra" else "Legacy 一对交易"
+
+
+    # 记录本轮中最后一次失败的交易的原因（如有）
+    last_error_reason: Optional[str] = None
+
+    # 本轮运行的累计统计数据
+    total_sol_spent_lamports = 0
+    total_usdc_received_units = 0
+    total_usdc_spent_units = 0
+    total_sol_bought_lamports = 0
+
+
+    while success_pairs < cfg.max_runs:
+        try:
+            if not cfg.enable_trading:
+                if mode == "ultra":
+                    logger.info(
+                        "当前配置已关闭真实交易（enable_trading=false），本轮仅做心跳检查, 视为一对交易成功。"
+                    )
+                else:
+                    logger.info(
+                        "当前配置已关闭真实交易（enable_trading=false），本轮仅做心跳检查, 视为一笔 Legacy 一对交易成功。"
+                    )
+
+                pair_ok = True
+                pair_stats = {
+                    "sol_spent_lamports": 0,
+                    "usdc_received_units": 0,
+                    "usdc_spent_units": 0,
+                    "sol_bought_lamports": 0,
+                }
+                pair_error = None
+            else:
+                if mode == "ultra":
+                    logger.info("开始执行第 %d 对交易 (SOL->USDC->SOL)...", success_pairs + 1)
+                else:
+                    logger.info(
+                        "开始执行第 %d 次 Legacy 一对交易 (SOL->USDC->SOL)...",
+                        success_pairs + 1,
+                    )
+
+
+                # 每轮交易开始时记录钱包当前余额
+                try:
+                    sol_before_pair, usdc_before_pair = get_wallet_balances(
+                        client,
+                        wallet_pubkey,
+                        USDC_MINT,
+                        logger,
+                        cfg.rpc_url,
+                        cfg.retry_max_attempts,
+                        cfg.retry_sleep_s,
+                    )
+
+                    tx_logger.info(
+                        "余额快照 阶段=一对开始 钱包_SOL_lamports=%d 钱包_SOL=%.9f 钱包_USDC_units=%d 钱包_USDC=%.6f",
+                        sol_before_pair,
+                        sol_before_pair / 1_000_000_000,
+                        usdc_before_pair,
+                        usdc_before_pair / 1_000_000,
+                    )
+
+                    # 只有在成功获取余额的情况下才继续执行一轮交易
+                    pair_ok, pair_stats, pair_error = execute_round_fn(
+                        client,
+                        keypair,
+                        cfg,
+                        logger,
+                        tx_logger,
+                    )
+
+                except Exception as e:  # noqa: BLE001
+                    logger.error("获取一对交易开始前钱包余额失败: %s", e)
+                    pair_ok = False
+                    pair_stats = {
+                        "sol_spent_lamports": 0,
+                        "usdc_received_units": 0,
+                        "usdc_spent_units": 0,
+                        "sol_bought_lamports": 0,
+                    }
+                    pair_error = f"获取一对交易开始前钱包余额失败: {e}"
+
+            if pair_ok:
+                # 累加本轮统计数据
+                total_sol_spent_lamports += int(pair_stats.get("sol_spent_lamports", 0))
+                total_usdc_received_units += int(pair_stats.get("usdc_received_units", 0))
+                total_usdc_spent_units += int(pair_stats.get("usdc_spent_units", 0))
+                total_sol_bought_lamports += int(
+                    pair_stats.get("sol_bought_lamports", 0)
+                )
+                # 成功后清空上一次的失败原因
+                last_error_reason = None
+            else:
+                # 记录本次失败原因, 并在交易日志中输出
+                last_error_reason = (
+                    pair_error
+                    or f"{unit_label}执行失败, 具体原因请查看 app.log 中的上一条 ERROR 日志。"
+                )
+                tx_logger.info(
+                    "本次 %s 失败 原因=%s",
+                    unit_label,
+                    last_error_reason,
+                )
+
+                # 如果是余额不足类错误，视为致命错误，立即终止自动交易循环
+                if last_error_reason:
+                    lower_reason = last_error_reason.lower()
+                    if (
+                        "余额不足" in last_error_reason
+                        or "资金不足" in last_error_reason
+                        or "insufficient" in lower_reason
+                    ):
+                        logger.error(
+                            "检测到余额不足相关错误(原因=%s)，自动交易循环将立即终止，不再继续后续轮次。",
+                            last_error_reason,
+                        )
+                        break
+
+
+
+        except KeyboardInterrupt:
+            # 用户主动终止程序
+            logger.info("检测到用户中断（Ctrl + C），程序即将优雅退出。")
+            break
+        except Exception as e:  # noqa: BLE001
+            # 兜底异常处理，保证任何异常都有清晰日志
+            logger.error("主循环中出现未捕获异常：%s", e)
+            logger.debug("主循环未捕获异常堆栈：\n%s", traceback.format_exc())
+            break
+
+        if pair_ok:
+            success_pairs += 1
+            logger.info("第 %d 次 %s 执行成功。", success_pairs, unit_label)
+        else:
+            logger.error(
+                "本次 %s 执行失败, 不计入成功次数。本轮将继续尝试下一次 %s（当前为测试模式，不终止循环）。",
+                unit_label,
+                unit_label,
+            )
+
+            # 测试阶段: 一对交易失败后不再终止整个循环, 而是继续下一轮
+            continue
+
+        if success_pairs >= cfg.max_runs:
+            logger.info(
+                "已完成配置要求的 %s 成功次数 max_runs=%d, 程序将退出。",
+                unit_label,
+                cfg.max_runs,
+            )
+
+            break
+
+        # 间隔一段时间后, 在下一笔交易前休眠一段时间
+        logger.debug("本次一对交易结束, 休眠 %d 秒后继续下一笔交易。", cfg.tx_interval_s)
+        time.sleep(cfg.tx_interval_s)
+
+    # 5. 本轮运行结束后的统计输出
+    if cfg.enable_trading:
+        logger.info(
+            "本轮统计: 成功 %s 次数=%d, 初始花费 SOL 总数=%.9f SOL (lamports=%d), "
+            "获得 USDC 总数≈%.6f USDC (最小单位=%d), 花费 USDC 总数≈%.6f USDC (最小单位=%d), "
+            "最终买回 SOL 总数=%.9f SOL (lamports=%d)。",
+            unit_label,
+            success_pairs,
+            total_sol_spent_lamports / 1_000_000_000 if total_sol_spent_lamports else 0.0,
+            total_sol_spent_lamports,
+            total_usdc_received_units / 1_000_000 if total_usdc_received_units else 0.0,
+            total_usdc_received_units,
+            total_usdc_spent_units / 1_000_000 if total_usdc_spent_units else 0.0,
+            total_usdc_spent_units,
+            total_sol_bought_lamports / 1_000_000_000 if total_sol_bought_lamports else 0.0,
+            total_sol_bought_lamports,
+        )
+        tx_logger.info(
+            "本轮统计: 成功 %s 次数=%d, 初始花费 SOL 总数=%.9f SOL (lamports=%d), "
+            "获得 USDC 总数≈%.6f USDC (最小单位=%d), 花费 USDC 总数≈%.6f USDC (最小单位=%d), "
+            "最终买回 SOL 总数=%.9f SOL (lamports=%d)。",
+            unit_label,
+            success_pairs,
+            total_sol_spent_lamports / 1_000_000_000 if total_sol_spent_lamports else 0.0,
+            total_sol_spent_lamports,
+            total_usdc_received_units / 1_000_000 if total_usdc_received_units else 0.0,
+            total_usdc_received_units,
+            total_usdc_spent_units / 1_000_000 if total_usdc_spent_units else 0.0,
+            total_usdc_spent_units,
+            total_sol_bought_lamports / 1_000_000_000 if total_sol_bought_lamports else 0.0,
+            total_sol_bought_lamports,
+        )
+
+        # Legacy 模式下输出一行专用的 USDC 汇总统计，便于快速查看总输出
+        if mode == "legacy":
+            logger.info(
+                "Legacy 模式专用统计: 累计获得 USDC ≈%.6f USDC (最小单位=%d)。",
+                total_usdc_received_units / 1_000_000 if total_usdc_received_units else 0.0,
+                total_usdc_received_units,
+            )
+            tx_logger.info(
+                "Legacy 模式专用统计: 累计获得 USDC ≈%.6f USDC (最小单位=%d)。",
+                total_usdc_received_units / 1_000_000 if total_usdc_received_units else 0.0,
+                total_usdc_received_units,
+            )
+
+        if last_error_reason:
+
+            logger.error("本轮存在交易失败, 失败原因: %s", last_error_reason)
+            tx_logger.info("本轮存在交易失败, 失败原因: %s", last_error_reason)
+
+    else:
+        logger.info(
+            "本轮统计: 当前 enable_trading=false, 未发送任何真实交易。成功 %s 次数=%d, 统计的 SOL/USDC 数量均为 0。",
+            unit_label,
+            success_pairs,
+        )
+        tx_logger.info(
+            "本轮统计: 当前 enable_trading=false, 未发送任何真实交易。成功 %s 次数=%d, 统计的 SOL/USDC 数量均为 0。",
+            unit_label,
+            success_pairs,
+        )
+
+
+
+
 def run_auto_trader() -> None:
     """主入口：加载配置、初始化客户端并循环执行自动交易。"""
 
@@ -1904,220 +2481,35 @@ def run_auto_trader() -> None:
         logger.debug("RPC 初始化异常堆栈：\n%s", traceback.format_exc())
         return
 
-    # # 3.5 初始化或获取 Referral Account (用于收取集成商费用)
-    # global _referral_account
-    # if cfg.enable_referral:
-    #     if not _referral_account:
-    #         referral_account = get_or_create_referral_account(client, keypair, logger)
-    #         if referral_account:
-    #             _referral_account = referral_account
-    #             logger.info("Referral Account 已设置: %s", _referral_account)
-    #         else:
-    #             logger.error(
-    #                 "创建 Referral Account 失败，程序终止。请检查钱包 SOL 余额是否充足（建议至少 0.01 SOL）。"
-    #             )
-    #             return
-    #     else:
-    #         logger.info("使用预配置的 Referral Account: %s", _referral_account)
-    # else:
-    #     logger.info("当前配置已关闭 Referral 功能，不会创建或使用推荐账户。")
-
-
-    # 4. 自动交易循环
-    logger.info('开始进入自动交易循环，每一轮都会执行"一对交易" (SOL->USDC->SOL)，按 Ctrl + C 可手动停止程序。')
-
-    success_pairs = 0
-
-    # 记录本轮中最后一次失败的一对交易的原因（如有）
-    last_error_reason: Optional[str] = None
-
-    # 本轮运行的累计统计数据
-
-    total_sol_spent_lamports = 0
-    total_usdc_received_units = 0
-    total_usdc_spent_units = 0
-    total_sol_bought_lamports = 0
-
-    while success_pairs < cfg.max_runs:
-        try:
-            if not cfg.enable_trading:
-                logger.info(
-                    "当前配置已关闭真实交易（enable_trading=false），本轮仅做心跳检查, 视为一对交易成功。"
-                )
-                pair_ok = True
-            else:
-                logger.info("开始执行第 %d 对交易 (SOL->USDC->SOL)...", success_pairs + 1)
-
-                # 每轮交易开始时记录钱包当前余额
-                try:
-                    sol_before_pair, usdc_before_pair = get_wallet_balances(
-                        client,
-                        wallet_pubkey,
-                        USDC_MINT,
-                        logger,
-                        cfg.rpc_url,
-                        cfg.retry_max_attempts,
-                        cfg.retry_sleep_s,
-                    )
-
-
-                    tx_logger.info(
-                        "余额快照 阶段=一对开始 钱包_SOL_lamports=%d 钱包_SOL=%.9f 钱包_USDC_units=%d 钱包_USDC=%.6f",
-                        sol_before_pair,
-                        sol_before_pair / 1_000_000_000,
-                        usdc_before_pair,
-                        usdc_before_pair / 1_000_000,
-                    )
-
-                    # 只有在成功获取余额的情况下才继续执行一对交易
-                    pair_ok, pair_stats, pair_error = execute_trade_pair(
-                        client, keypair, cfg, logger, tx_logger
-                    )
-
-                except Exception as e:  # noqa: BLE001
-                    logger.error("获取一对交易开始前钱包余额失败: %s", e)
-                    pair_ok = False
-                    pair_stats = {
-                        "sol_spent_lamports": 0,
-                        "usdc_received_units": 0,
-                        "usdc_spent_units": 0,
-                        "sol_bought_lamports": 0,
-                    }
-                    pair_error = f"获取一对交易开始前钱包余额失败: {e}"
-
-
-
-                if pair_ok:
-                    # 累加本轮统计数据
-                    total_sol_spent_lamports += int(
-                        pair_stats.get("sol_spent_lamports", 0)
-                    )
-                    total_usdc_received_units += int(
-                        pair_stats.get("usdc_received_units", 0)
-                    )
-                    total_usdc_spent_units += int(
-                        pair_stats.get("usdc_spent_units", 0)
-                    )
-                    total_sol_bought_lamports += int(
-                        pair_stats.get("sol_bought_lamports", 0)
-                    )
-                    # 成功后清空上一次的失败原因
-                    last_error_reason = None
-                else:
-                    # 记录本次失败原因, 并在交易日志中输出
-                    last_error_reason = (
-                        pair_error
-                        or "一对交易执行失败, 具体原因请查看 app.log 中的上一条 ERROR 日志。"
-                    )
-                    tx_logger.info(
-                        "本次一对交易失败 原因=%s",
-                        last_error_reason,
-                    )
-
-
-
-        except KeyboardInterrupt:
-            # 用户主动终止程序
-            logger.info("检测到用户中断（Ctrl + C），程序即将优雅退出。")
-            break
-        except Exception as e:  # noqa: BLE001
-            # 兜底异常处理，保证任何异常都有清晰日志
-            logger.error("主循环中出现未捕获异常：%s", e)
-            logger.debug("主循环未捕获异常堆栈：\n%s", traceback.format_exc())
-            break
-
-        # 记录一对交易结束后的钱包余额（暂时注释掉，减少 RPC 调用）
-        # if cfg.enable_trading:
-        #     try:
-        #         sol_after_pair, usdc_after_pair = get_wallet_balances(
-        #             client,
-        #             wallet_pubkey,
-        #             USDC_MINT,
-        #             logger,
-        #             cfg.rpc_url,
-        #         )
-        #
-        #         tx_logger.info(
-        #             "余额快照 阶段=一对结束 钱包_SOL_lamports=%d 钱包_SOL=%.9f 钱包_USDC_units=%d 钱包_USDC=%.6f",
-        #             sol_after_pair,
-        #             sol_after_pair / 1_000_000_000,
-        #             usdc_after_pair,
-        #             usdc_after_pair / 1_000_000,
-        #         )
-        #
-        #     except Exception as e:  # noqa: BLE001
-        #         logger.error("获取一对交易结束后钱包余额失败: %s", e)
-
-        if pair_ok:
-            success_pairs += 1
-            logger.info("第 %d 对交易执行成功。", success_pairs)
-        else:
-            logger.error(
-                "本次一对交易执行失败, 不计入成功次数。本轮将继续尝试下一对交易（当前为测试模式，不终止循环）。"
-            )
-            # 测试阶段: 一对交易失败后不再终止整个循环, 而是继续下一轮
-            continue
-
-
-
-        if success_pairs >= cfg.max_runs:
-            logger.info(
-                "已完成配置要求的一对交易成功次数 max_runs=%d, 程序将退出。",
-                cfg.max_runs,
-            )
-            break
-
-        # 间隔一段时间后, 在下一笔交易前休眠一段时间
-        logger.debug("本次一对交易结束, 休眠 %d 秒后继续下一笔交易。", cfg.tx_interval_s)
-        time.sleep(cfg.tx_interval_s)
-
-
-    # 5. 本轮运行结束后的统计输出
-    if cfg.enable_trading:
+    # 3.5 根据模式选择执行 Ultra 一对交易循环或 Legacy Swap 循环
+    if getattr(cfg, "legacy_mode", False):
         logger.info(
-            "本轮统计: 成功一对交易次数=%d, 初始花费 SOL 总数=%.9f SOL (lamports=%d), "
-            "获得 USDC 总数≈%.6f USDC (最小单位=%d), 花费 USDC 总数≈%.6f USDC (最小单位=%d), "
-            "最终买回 SOL 总数=%.9f SOL (lamports=%d)。",
-            success_pairs,
-            total_sol_spent_lamports / 1_000_000_000 if total_sol_spent_lamports else 0.0,
-            total_sol_spent_lamports,
-            total_usdc_received_units / 1_000_000 if total_usdc_received_units else 0.0,
-            total_usdc_received_units,
-            total_usdc_spent_units / 1_000_000 if total_usdc_spent_units else 0.0,
-            total_usdc_spent_units,
-            total_sol_bought_lamports / 1_000_000_000 if total_sol_bought_lamports else 0.0,
-            total_sol_bought_lamports,
+            "检测到 legacy_mode=true，将使用 Jupiter Legacy Swap API 执行自动交易循环，不执行 Ultra 一对交易。"
         )
-        tx_logger.info(
-            "本轮统计: 成功一对交易次数=%d, 初始花费 SOL 总数=%.9f SOL (lamports=%d), "
-            "获得 USDC 总数≈%.6f USDC (最小单位=%d), 花费 USDC 总数≈%.6f USDC (最小单位=%d), "
-            "最终买回 SOL 总数=%.9f SOL (lamports=%d)。",
-            success_pairs,
-            total_sol_spent_lamports / 1_000_000_000 if total_sol_spent_lamports else 0.0,
-            total_sol_spent_lamports,
-            total_usdc_received_units / 1_000_000 if total_usdc_received_units else 0.0,
-            total_usdc_received_units,
-            total_usdc_spent_units / 1_000_000 if total_usdc_spent_units else 0.0,
-            total_usdc_spent_units,
-            total_sol_bought_lamports / 1_000_000_000 if total_sol_bought_lamports else 0.0,
-            total_sol_bought_lamports,
+        run_trading_loop(
+            cfg=cfg,
+            client=client,
+            keypair=keypair,
+            logger=logger,
+            tx_logger=tx_logger,
+            wallet_pubkey=wallet_pubkey,
+            mode="legacy",
+            execute_round_fn=exec_legacy_tx,
         )
-        if last_error_reason:
-            logger.error("本轮存在交易失败, 失败原因: %s", last_error_reason)
-            tx_logger.info("本轮存在交易失败, 失败原因: %s", last_error_reason)
-
     else:
-        logger.info(
-            "本轮统计: 当前 enable_trading=false, 未发送任何真实交易。成功一对次数=%d, 统计的 SOL/USDC 数量均为 0。",
-            success_pairs,
+        run_trading_loop(
+            cfg=cfg,
+            client=client,
+            keypair=keypair,
+            logger=logger,
+            tx_logger=tx_logger,
+            wallet_pubkey=wallet_pubkey,
+            mode="ultra",
+            execute_round_fn=execute_trade_pair,
         )
-        tx_logger.info(
-            "本轮统计: 当前 enable_trading=false, 未发送任何真实交易。成功一对次数=%d, 统计的 SOL/USDC 数量均为 0。",
-            success_pairs,
-        )
-
 
     logger.info("===== 程序结束，感谢使用 =====")
+
 
 
 if __name__ == "__main__":
