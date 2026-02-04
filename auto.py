@@ -33,6 +33,7 @@ import hashlib
 from dataclasses import dataclass
 from typing import Optional
 import base64
+import base58
 import random
 import requests
 
@@ -40,12 +41,13 @@ from solders.keypair import Keypair
 from solders.transaction import VersionedTransaction
 from solders import message as solders_message
 from solders.pubkey import Pubkey
-from solders.instruction import Instruction, AccountMeta
-from solders.system_program import ID as SYSTEM_PROGRAM_ID
-from solders.message import MessageV0
 from solana.rpc.api import Client
 from solana.rpc.types import TokenAccountOpts
-from spl.token.constants import TOKEN_PROGRAM_ID
+from solana.transaction import Transaction
+# from solders.instruction import Instruction, AccountMeta
+# from solders.system_program import ID as SYSTEM_PROGRAM_ID
+# from solders.message import MessageV0
+# from spl.token.constants import TOKEN_PROGRAM_ID
 
 
 # ===== 全局常量 =====
@@ -58,8 +60,14 @@ USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 # https://portal.jup.ag/api-keys
 # JUPITER_ULTRA_API_BASE = "https://ultra-api.jup.ag"
 JUPITER_ULTRA_API_BASE = "https://api.jup.ag/ultra/v1"
-# JUPITER_ULTRA_API_BASE = "https://api.jup.ag/swap/v1"
 ULTRA_API_KEY = "72675114-cb71-4b8b-8c21-c429b1082843"
+JUPITER_LEGACY_API_BASE = "https://api.jup.ag/swap/v1"
+
+
+# 默认 RPC URL 常量，便于集中管理和修改
+DEFAULT_MAINNET_RPC_URL = "https://solana-rpc.publicnode.com"
+DEFAULT_TESTNET_RPC_URL = "https://solana-testnet.api.onfinality.io/public"
+
 
 # Referral 配置 (用于收取集成商费用)
 # referralAccount: 你的推荐账户公钥 (需要先在链上创建)
@@ -77,10 +85,83 @@ ULTRA_API_KEY = "72675114-cb71-4b8b-8c21-c429b1082843"
 # Referral 账户名称 (用于创建时标识)
 # REFERRAL_NAME = "solana_auto_trader"
 
-
 # 可以通过环境变量 SOLANA_AUTO_CONFIG 覆盖配置文件路径
 DEFAULT_CONFIG_PATH = "config.json"
 CONFIG_PATH = os.environ.get("SOLANA_AUTO_CONFIG", DEFAULT_CONFIG_PATH)
+
+# -------------------------- 2. 请求Legacy API获取交易指令 --------------------------
+def get_swap_transaction():
+    """请求Legacy Swap API，获取包含自定义priorityFee的交易指令"""
+    headers = {"Content-Type": "application/json"}
+    payload = {
+        "inputMint": INPUT_MINT,
+        "outputMint": OUTPUT_MINT,
+        "amount": AMOUNT,
+        "slippageBps": SLIPPAGE_BPS,
+        "userPublicKey": USER_PUBKEY,
+        # 核心：设置自定义优先费用（2种方式二选一，推荐方式1）
+        # 方式1：直接设置具体优先费用金额（Lamports）
+        "prioritizationFeeLamports": PRIORITY_FEE,
+        # 方式2：设置计算单元价格（可选，与prioritizationFeeLamports二选一）
+        # "computeUnitPriceMicroLamports": 1000  # 计算单元价格，用于自动计算优先费
+    }
+    
+    try:
+        response = requests.post(LEGACY_SWAP_API_URL, headers=headers, json=payload)
+        response.raise_for_status()  # 抛出HTTP请求错误
+        data = response.json()
+        # 提取Base64编码的交易指令
+        swap_tx_base64 = data.get("swapTransaction")
+        if not swap_tx_base64:
+            raise Exception("获取交易指令失败，未返回swapTransaction字段")
+        return swap_tx_base64
+    except Exception as e:
+        print(f"请求交易指令出错：{str(e)}")
+        raise
+
+# -------------------------- 3. 解码、签名交易 --------------------------
+def sign_transaction(swap_tx_base64):
+    """解码交易指令，使用用户钱包签名交易"""
+    # 解码Base64交易数据
+    tx_data = base64.b64decode(swap_tx_base64)
+    # 反序列化为Solana交易对象
+    transaction = Transaction.deserialize(tx_data)
+    # 使用用户私钥签名交易
+    transaction.sign(USER_KEYPAIR)
+    # 序列化签名后的交易（用于提交上链）
+    signed_tx = transaction.serialize()
+    # 转为Base64格式，用于提交API
+    signed_tx_base64 = base64.b64encode(signed_tx).decode("utf-8")
+    return signed_tx_base64
+
+# -------------------------- 4. 提交交易到Solana网络 --------------------------
+def submit_transaction(signed_tx_base64):
+    """提交签名后的交易到Solana网络，返回交易ID"""
+    try:
+        # 提交交易（使用solana-web3.py客户端）
+        response = SOLANA_CLIENT.send_raw_transaction(signed_tx_base64)
+        tx_id = response.value
+        print(f"交易提交成功！交易ID：{tx_id}")
+        print(f"交易详情可查看：https://solscan.io/tx/{tx_id}?cluster=devnet")  # 测试网地址，主网替换为cluster=mainnet
+        return tx_id
+    except Exception as e:
+        print(f"提交交易出错：{str(e)}")
+        raise
+
+# -------------------------- 5. 执行完整交易流程 --------------------------
+def exec_legacy_tx():
+    try:
+        print("=== 开始执行带priorityFee的Swap交易 ===")
+        # 1. 获取交易指令
+        swap_tx_base64 = get_swap_transaction()
+        print("✅ 成功获取交易指令")
+        # 2. 签名交易
+        signed_tx_base64 = sign_transaction(swap_tx_base64)
+        print("✅ 成功签名交易")
+        # 3. 提交交易
+        tx_id = submit_transaction(signed_tx_base64)
+    except Exception as e:
+        print(f"❌ 交易执行失败：{str(e)}")
 
 @dataclass
 class AppConfig:
@@ -176,16 +257,14 @@ def load_config(path: str) -> AppConfig:
     rpc_url = raw.get("rpc_url")
     if not rpc_url:
         if network == "mainnet":
-            # rpc_url = "https://api.mainnet-beta.solana.com"
-            rpc_url = "https://solana-rpc.publicnode.com"
+            rpc_url = DEFAULT_MAINNET_RPC_URL
         elif network == "testnet":
-            # rpc_url = "https://api.testnet.solana.com"
-            # rpc_url = "https://api.devnet.solana.com"
-            rpc_url = "https://solana-testnet.api.onfinality.io/public"
+            rpc_url = DEFAULT_TESTNET_RPC_URL
         else:
             raise ValueError(
                 f"未知 network 类型：{network}，请使用 mainnet / testnet 之一。"
             )
+
 
     # 必填字段简单校验
     if "private_key" not in raw:
