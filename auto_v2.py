@@ -124,6 +124,7 @@ def setup_logging(log_dir: str = "logs") -> tuple[logging.Logger, logging.Logger
     tx_logger = logging.getLogger("solana_auto_v2.tx")
     tx_logger.setLevel(logging.INFO)
     tx_logger.handlers.clear()
+    tx_logger.propagate = False  # 禁止日志向上传播到父 logger, 避免重复输出
 
     tx_file_handler = logging.handlers.RotatingFileHandler(
         os.path.join(log_dir, "transactions_v2.log"),
