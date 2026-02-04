@@ -1,5 +1,10 @@
-
 python310
 .venv
 solana_auto_package.zip
 logs
+build
+config.json
+config_test.json
+config_v1.json
+solana_auto.exe
+solana_auto.spec
