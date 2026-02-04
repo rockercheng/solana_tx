@@ -318,11 +318,11 @@ def http_request_with_retry(
                 )
         except Exception as e:  # noqa: BLE001
             if attempt >= max_attempts:
-                logger.error("%s失败(已重试 %d 次, 请求异常): %s", label, attempt, e)
+                logger.error("%s失败(已重试 %d 次, 请求异常): %s", label, max_attempts, e)
                 raise RuntimeError(f"{label}失败(请求异常): {e}") from e
 
             logger.warning(
-                "%s失败(尝试 %d/%d, 请求异常): %s",
+                "%s失败(第 %d 次重试, 共 %d 次, 请求异常): %s",
                 label,
                 attempt,
                 max_attempts,
@@ -340,7 +340,7 @@ def http_request_with_retry(
                     response_hook(resp, attempt, max_attempts)
                 except Exception as hook_e:  # noqa: BLE001
                     logger.warning(
-                        "%s 的 response_hook 执行异常(尝试 %d/%d): %s",
+                        "%s 的 response_hook 执行异常(第 %d 次重试, 共 %d 次): %s",
                         label,
                         attempt,
                         max_attempts,
@@ -358,14 +358,14 @@ def http_request_with_retry(
                 logger.error(
                     "%s失败(已重试 %d 次), HTTP %d: %s",
                     label,
-                    attempt,
+                    max_attempts,
                     resp.status_code,
                     last_resp_text,
                 )
                 raise RuntimeError(f"{label}失败, HTTP {resp.status_code}: {last_resp_text}")
 
             logger.warning(
-                "%s失败(尝试 %d/%d), HTTP %d: %s",
+                "%s失败(第 %d 次重试, 共 %d 次), HTTP %d: %s",
                 label,
                 attempt,
                 max_attempts,
@@ -534,19 +534,19 @@ def get_usdc_balance_with_retry(
                     pass
             
             if total > 0:
-                logger.debug("第 %d 次尝试获取 USDC 余额成功: %d", attempt, total)
+                logger.debug("第 %d 次重试: 获取 USDC 余额成功: %d", attempt, total)
                 return total
             
             # 如果余额为 0, 可能是数据未同步, 继续重试
             if attempt < retry_max_attempts:
                 logger.debug(
-                    "第 %d 次尝试获取 USDC 余额为 0, 等待 %d 秒后重试...",
+                    "第 %d 次重试: 获取 USDC 余额为 0, 等待 %d 秒后重试...",
                     attempt,
                     retry_sleep_s,
                 )
                 time.sleep(retry_sleep_s)
         except Exception as e:  # noqa: BLE001
-            logger.warning("第 %d 次尝试获取 USDC 余额失败: %s", attempt, e)
+            logger.warning("第 %d 次重试: 获取 USDC 余额失败: %s", attempt, e)
             if attempt < retry_max_attempts:
                 time.sleep(retry_sleep_s)
     
