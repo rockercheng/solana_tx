@@ -330,7 +330,17 @@ def http_request_with_retry(
             )
         else:
             if resp.status_code == 200:
+                # 如果经历过重试才成功, 额外输出一条成功日志
+                if attempt > 1:
+                    retry_count = attempt - 1
+                    logger.info(
+                        "%s在第 %d 次重试后成功(共尝试 %d 次)",
+                        label,
+                        retry_count,
+                        attempt,
+                    )
                 return resp
+
 
             last_resp_text = resp.text or ""
 
@@ -389,74 +399,50 @@ def get_usdc_balance(
     retry_max_attempts: int = 10,
     retry_sleep_s: int = 2,
 ) -> int:
-    """查询指定钱包当前的 USDC 余额(最小单位). 
-    
-    改进点：
-    1. 显式指定 commitment: "confirmed" 确保读取已确认的数据
-    2. 增加重试机制
-    3. 增加 Token Account 解析容错
+    """查询指定钱包当前的 USDC 余额(最小单位).
+
+    直接使用原始 JSON-RPC 调用, 并带有重试和解析容错.
     """
 
-    owner_pk = Pubkey.from_string(owner_pubkey)
-    mint_pk = Pubkey.from_string(usdc_mint)
+    # 如果未显式传入 rpc_url, 则尝试从 client 中获取
+    if rpc_url is None:
+        try:
+            rpc_url = getattr(getattr(client, "_provider", None), "endpoint_uri", None)
+        except Exception:  # noqa: BLE001
+            rpc_url = None
 
-    # 使用 TokenAccountOpts, 以兼容当前 solana-py 版本
-    opts = TokenAccountOpts(mint=mint_pk, encoding="jsonParsed")
+    if not rpc_url:
+        # 无法获得 RPC 地址, 只能把异常抛出去
+        raise RuntimeError("获取 USDC 余额失败: 无法确定 RPC URL")
 
-    try:
-        resp = client.get_token_accounts_by_owner(owner_pk, opts)
+    # 显式指定 commitment: "confirmed" 确保读取已确认的数据
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getTokenAccountsByOwner",
+        "params": [
+            owner_pubkey,
+            {"mint": usdc_mint},
+            {"encoding": "jsonParsed", "commitment": "confirmed"},
+        ],
+    }
 
-        # 兼容 typed 响应和 dict 响应两种形式
-        if hasattr(resp, "value"):
-            value = resp.value
-        else:
-            result = resp.get("result", {})
-            value = result.get("value", [])
-    except Exception as e:  # noqa: BLE001
-        # 这一层失败通常是响应结构与当前 solana-py 版本的 typed 定义不完全匹配
-        # 下面会自动退回到原始 JSON-RPC 调用, 因此这里仅记录为 WARNING
-        logger.warning("通过 solana-py 获取 USDC 余额失败, 将退回原始 JSON-RPC 调用: %s", e)
-
-        # 如果未显式传入 rpc_url, 则尝试从 client 中获取
-        if rpc_url is None:
-            try:
-                rpc_url = getattr(getattr(client, "_provider", None), "endpoint_uri", None)
-            except Exception:  # noqa: BLE001
-                rpc_url = None
-
-        if not rpc_url:
-            # 无法获得 RPC 地址, 只能把异常抛出去
-            raise
-
-        # 退回到直接使用 JSON-RPC 请求, 并增加重试机制
-        # 显式指定 commitment: "confirmed" 确保读取已确认的数据
-        payload = {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "getTokenAccountsByOwner",
-            "params": [
-                owner_pubkey,
-                {"mint": usdc_mint},
-                {"encoding": "jsonParsed", "commitment": "confirmed"},
-            ],
-        }
-
-        http_resp = http_request_with_retry(
-            cfg=None,
-            logger=logger,
-            label="使用原始 RPC 请求获取 USDC 余额",
-            method="POST",
-            url=rpc_url,
-            headers={"Content-Type": "application/json"},
-            json_body=payload,
-            timeout=20,
-            treat_insufficient_as_fatal=False,
-            max_attempts=retry_max_attempts,
-            sleep_s=retry_sleep_s,
-        )
-        data = http_resp.json()
-        result = data.get("result", {})
-        value = result.get("value", [])
+    http_resp = http_request_with_retry(
+        cfg=None,
+        logger=logger,
+        label="使用原始 RPC 请求获取 USDC 余额",
+        method="POST",
+        url=rpc_url,
+        headers={"Content-Type": "application/json"},
+        json_body=payload,
+        timeout=20,
+        treat_insufficient_as_fatal=False,
+        max_attempts=retry_max_attempts,
+        sleep_s=retry_sleep_s,
+    )
+    data = http_resp.json()
+    result = data.get("result", {})
+    value = result.get("value", [])
 
     total = 0
     for item in value:
@@ -464,24 +450,17 @@ def get_usdc_balance(
             # 增加容错处理
             if isinstance(item, dict):
                 account = item.get("account", {})
-                data = account.get("data", {})
-                if isinstance(data, dict):
-                    parsed = data.get("parsed", {})
+                data_inner = account.get("data", {})
+                if isinstance(data_inner, dict):
+                    parsed = data_inner.get("parsed", {})
                     info = parsed.get("info", {})
-                    token_amount = info.get("tokenAmount", {})
-                    amount_str = token_amount.get("amount", "0")
-                    total += int(amount_str)
-            elif hasattr(item, "account"):
-                # 处理 typed 响应
-                account = item.account
-                if hasattr(account, "data") and hasattr(account.data, "parsed"):
-                    info = account.data.parsed.get("info", {})
                     token_amount = info.get("tokenAmount", {})
                     amount_str = token_amount.get("amount", "0")
                     total += int(amount_str)
         except Exception as parse_e:  # noqa: BLE001
             logger.debug("解析 USDC 余额时跳过异常账户: %s, 错误: %s", item, parse_e)
     return total
+
 
 
 def get_usdc_balance_with_retry(
@@ -495,7 +474,7 @@ def get_usdc_balance_with_retry(
 ) -> int:
     """带重试的 USDC 余额查询, 在交易确认后使用. 
     
-    在第一步交易确认后, RPC 节点可能还未同步最新状态,
+    在第 1 步交易确认后, RPC 节点可能还未同步最新状态,
     因此需要多次重试以获取正确的 USDC 余额.
     """
     
@@ -557,18 +536,15 @@ def get_usdc_balance_with_retry(
     )
 
 
-def get_wallet_balances(
+def get_sol_balance(
     client: Client,
     owner_pubkey: str,
-    usdc_mint: str,
     logger: logging.Logger,
     rpc_url: Optional[str] = None,
     retry_max_attempts: int = 10,
     retry_sleep_s: int = 2,
-) -> tuple[int, int]:
-    """查询指定钱包当前的 SOL / USDC 余额. 
-    返回 (sol_lamports, usdc_units). 
-    """
+) -> int:
+    """查询指定钱包当前的 SOL 余额(最小单位 lamports)."""
 
     owner_pk = Pubkey.from_string(owner_pubkey)
 
@@ -620,9 +596,35 @@ def get_wallet_balances(
         data = http_resp.json()
         sol_lamports = int(data.get("result", {}).get("value", 0))
 
+    return sol_lamports
+
+
+def get_wallet_balances(
+    client: Client,
+    owner_pubkey: str,
+    usdc_mint: str,
+    logger: logging.Logger,
+    rpc_url: Optional[str] = None,
+    retry_max_attempts: int = 10,
+    retry_sleep_s: int = 2,
+) -> tuple[int, int]:
+    """查询指定钱包当前的 SOL / USDC 余额. 
+    返回 (sol_lamports, usdc_units). 
+    """
+
+    sol_lamports = get_sol_balance(
+        client,
+        owner_pubkey,
+        logger,
+        rpc_url,
+        retry_max_attempts,
+        retry_sleep_s,
+    )
+
     # 查询 USDC 余额(内部同样带有原始 JSON-RPC 兜底)
     usdc_units = get_usdc_balance(client, owner_pubkey, usdc_mint, logger, rpc_url)
     return sol_lamports, usdc_units
+
 
 
 def wait_for_transaction_confirmation(
@@ -725,7 +727,7 @@ def swap_get_quote(
     output_mint: str,
     amount: int,
 ) -> dict:
-    """调用 Jupiter Swap API 的 /quote 接口获取报价. 
+    """调用 Jupiter Swap API 的 /quote 接口获取询价. 
     
     参数:
         input_mint: 输入代币 Mint 地址
@@ -748,12 +750,12 @@ def swap_get_quote(
         "x-api-key": SWAP_API_KEY,
     }
     
-    logger.debug("请求 Swap Quote: %s", quote_url)
+    logger.debug("请求 Swap 询价: %s", quote_url)
     
     resp = http_request_with_retry(
         cfg=cfg,
         logger=logger,
-        label=f"获取 {input_mint[:8]}...->{output_mint[:8]}... 报价",
+        label=f"获取 {input_mint[:8]}...->{output_mint[:8]}... 询价",
         method="GET",
         url=quote_url,
         session=http_session,
@@ -765,21 +767,21 @@ def swap_get_quote(
     try:
         quote_response = resp.json()
     except Exception as e:
-        logger.error("解析 Quote 响应 JSON 失败: %s, 原始响应: %s", e, resp.text)
-        raise RuntimeError(f"解析 Quote 响应 JSON 失败: {e}") from e
+        logger.error("解析 询价 响应 JSON 失败: %s, 原始响应: %s", e, resp.text)
+        raise RuntimeError(f"解析 询价 响应 JSON 失败: {e}") from e
     
     # 检查是否有错误
     if quote_response.get("error") or quote_response.get("errorCode"):
         error_msg = quote_response.get("error") or quote_response.get("errorMessage") or "未知错误"
-        raise RuntimeError(f"Quote 请求返回错误: {error_msg}")
+        raise RuntimeError(f"询价 请求返回错误: {error_msg}")
     
     # 检查 outAmount 是否有效
     out_amount = int(quote_response.get("outAmount", 0))
     if out_amount <= 0:
-        raise RuntimeError(f"Quote 返回的 outAmount 无效: {quote_response.get('outAmount')}")
+        raise RuntimeError(f"询价 返回的 outAmount 无效: {quote_response.get('outAmount')}")
     
     logger.info(
-        "Quote 成功: 输入=%d, 预计输出=%d, 滑点=%d bps",
+        "询价 成功: 输入=%d, 预计输出=%d, 滑点=%d bps",
         amount,
         out_amount,
         cfg.slippage_bps,
@@ -799,7 +801,7 @@ def swap_build_transaction(
     
     参数:
         user_pubkey: 用户钱包公钥
-        quote_response: /quote 返回的报价对象
+        quote_response: /quote 返回的询价对象
         
     返回:
         (swap_transaction_base64, last_valid_block_height)
@@ -946,21 +948,21 @@ def _execute_first_leg(
     trade_amount_sol_display: float,
     amount_sol_lamports: int,
 ) -> tuple[bool, dict, Optional[str], Optional[int]]:
-    """执行第一步 SOL->USDC 交易. 
+    """执行第 1 步 SOL->USDC 交易. 
     
     使用 Jupiter Swap API (GET /quote + POST /swap + RPC send)
     """
 
     error_reason: Optional[str] = None
 
-    # -------- 第一步: SOL -> USDC --------
+    # -------- 第 1 步: SOL -> USDC --------
     logger.info(
-        "一对交易-第 1 步: 准备将本次随机选取的 %.9f SOL 换为 USDC...",
+        "第 1 步: 随机选取 %.9f SOL 换为 USDC...",
         trade_amount_sol_display,
     )
 
     try:
-        # 1. 获取报价
+        # 1. 获取询价
         quote_response = swap_get_quote(
             cfg=cfg,
             logger=logger,
@@ -972,7 +974,7 @@ def _execute_first_leg(
         
         out_usdc_amount = int(quote_response.get("outAmount", 0))
         if out_usdc_amount <= 0:
-            error_reason = f"SOL->USDC Quote 返回的 outAmount 无效: {quote_response.get('outAmount')}"
+            error_reason = f"SOL->USDC 询价 返回的 outAmount 无效: {quote_response.get('outAmount')}"
             logger.error("%s, 完整响应: %s", error_reason, quote_response)
             return False, stats, error_reason, None
 
@@ -982,7 +984,7 @@ def _execute_first_leg(
         stats["usdc_spent_units"] = out_usdc_amount
 
         logger.info(
-            "SOL->USDC 报价成功: 输入=%d lamports (%.9f SOL), 预计输出=%d USDC units (%.6f USDC)",
+            "SOL->USDC 询价成功: 输入=%d lamports (%.9f SOL), 预计输出=%d USDC units (%.6f USDC)",
             amount_sol_lamports,
             amount_sol_lamports / 1_000_000_000,
             out_usdc_amount,
@@ -1007,7 +1009,7 @@ def _execute_first_leg(
             keypair=keypair,
         )
 
-        logger.info("一对交易-第 1 步 SOL->USDC 交易已提交, 签名: %s", sig1)
+        logger.info("第 1 步 SOL->USDC 交易已提交, 签名: %s", sig1)
 
         tx_logger.info(
             (
@@ -1027,16 +1029,16 @@ def _execute_first_leg(
         )
 
     except Exception as e:  # noqa: BLE001
-        error_reason = f"第一步 SOL->USDC 交易失败: {e}"
+        error_reason = f"第 1 步 SOL->USDC 交易失败: {e}"
         logger.error(error_reason)
-        logger.debug("第一步交易异常堆栈:\n%s", traceback.format_exc())
+        logger.debug("第 1 步交易异常堆栈:\n%s", traceback.format_exc())
         return False, stats, error_reason, None
 
-    # -------- 等待第一步交易链上确认 --------
-    # 这是关键步骤: 必须等第一步交易确认后才能执行第二步
+    # -------- 等待第 1 步交易链上确认 --------
+    # 这是关键步骤: 必须等第 1 步交易确认后才能执行第 2 步
     confirm_timeout = max(cfg.tx_interval_s, 30)
     logger.info(
-        "第一步 SOL->USDC 交易已提交, 开始等待最多 %d 秒以确认链上状态...",
+        "第 1 步 SOL->USDC 交易已提交, 开始等待最多 %d 秒以确认链上状态...",
         confirm_timeout,
     )
 
@@ -1054,9 +1056,9 @@ def _execute_first_leg(
         logger.error(error_reason)
         return False, stats, error_reason, None
 
-    logger.info("第一步 SOL->USDC 交易已在链上确认成功!")
+    logger.info("第 1 步 SOL->USDC 交易已在链上确认成功!")
 
-    # 在执行第二步前, 短暂等待让 RPC 节点同步数据
+    # 在执行第 2 步前, 短暂等待让 RPC 节点同步数据
     logger.debug("等待 2 秒让 RPC 节点同步数据...")
     time.sleep(2)
 
@@ -1082,26 +1084,26 @@ def _execute_first_leg(
         # 本次 USDC->SOL 使用当前钱包中全部 USDC 余额
         effective_usdc_amount = current_usdc_balance
 
-        # 获取 SOL 余额用于日志
+        # 获取 SOL 余额用于日志(只查询 SOL, USDC 直接复用上一步查询结果)
         try:
-            sol_after_leg1, _ = get_wallet_balances(
+            sol_after_leg1 = get_sol_balance(
                 client,
                 wallet_pubkey,
-                usdc_mint,
                 logger,
                 cfg.rpc_url,
                 cfg.retry_max_attempts,
                 cfg.retry_sleep_s,
             )
             tx_logger.info(
-                "余额快照 阶段=第一步后 钱包_SOL_lamports=%d 钱包_SOL=%.9f 钱包_USDC_units=%d 钱包_USDC=%.6f",
+                "余额快照 阶段=第 1 步后 钱包_SOL_lamports=%d 钱包_SOL=%.9f 钱包_USDC_units=%d 钱包_USDC=%.6f",
                 sol_after_leg1,
                 sol_after_leg1 / 1_000_000_000,
                 current_usdc_balance,
                 current_usdc_balance / 1_000_000,
             )
         except Exception as e:  # noqa: BLE001
-            logger.warning("获取第一步后 SOL 余额失败: %s", e)
+            logger.warning("获取第 1 步后 SOL 余额失败: %s", e)
+
 
     except Exception as e:  # noqa: BLE001
         error_reason = f"查询 USDC 余额失败: {e}"
@@ -1124,22 +1126,22 @@ def _execute_second_leg(
     usdc_mint: str,
     effective_usdc_amount: int,
 ) -> tuple[bool, dict, Optional[str]]:
-    """执行第二步 USDC->SOL 交易. 
+    """执行第 2 步 USDC->SOL 交易. 
     
     使用 Jupiter Swap API (GET /quote + POST /swap + RPC send)
     """
 
     error_reason: Optional[str] = None
 
-    # -------- 第二步: USDC -> SOL --------
+    # -------- 第 2 步: USDC -> SOL --------
     logger.info(
-        "一对交易-第 2 步: 准备将 %d USDC units (%.6f USDC) 换回 SOL...",
+        "第 2 步: 准备将 %d USDC units (%.6f USDC) 换回 SOL...",
         effective_usdc_amount,
         effective_usdc_amount / 1_000_000,
     )
 
     try:
-        # 1. 获取报价
+        # 1. 获取询价
         quote_response = swap_get_quote(
             cfg=cfg,
             logger=logger,
@@ -1151,12 +1153,12 @@ def _execute_second_leg(
         
         out_sol_lamports = int(quote_response.get("outAmount", 0))
         if out_sol_lamports <= 0:
-            error_reason = f"USDC->SOL Quote 返回的 outAmount 无效: {quote_response.get('outAmount')}"
+            error_reason = f"USDC->SOL 询价 返回的 outAmount 无效: {quote_response.get('outAmount')}"
             logger.error("%s, 完整响应: %s", error_reason, quote_response)
             return False, stats, error_reason
 
         logger.info(
-            "USDC->SOL 报价成功: 输入=%d USDC units (%.6f USDC), 预计输出=%d lamports (%.9f SOL)",
+            "USDC->SOL 询价成功: 输入=%d USDC units (%.6f USDC), 预计输出=%d lamports (%.9f SOL)",
             effective_usdc_amount,
             effective_usdc_amount / 1_000_000,
             out_sol_lamports,
@@ -1181,10 +1183,10 @@ def _execute_second_leg(
             keypair=keypair,
         )
 
-        # 第二步成功后, 记录最终买回的 SOL 数量
+        # 第 2 步成功后, 记录最终买回的 SOL 数量
         stats["sol_bought_lamports"] = out_sol_lamports
 
-        logger.info("一对交易-第 2 步完成, 交易签名: %s", sig2)
+        logger.info("第 2 步完成, 交易签名: %s", sig2)
         
         tx_logger.info(
             (
@@ -1214,10 +1216,10 @@ def _execute_second_leg(
             net_sol,
         )
 
-        # 等待第二步交易确认 (可选, 但建议等待以获取准确余额)
+        # 等待第 2 步交易确认 (可选, 但建议等待以获取准确余额)
         confirm_timeout = max(cfg.tx_interval_s, 20)
         logger.info(
-            "第二步 USDC->SOL 交易已提交, 开始等待最多 %d 秒以确认链上状态...",
+            "第 2 步 USDC->SOL 交易已提交, 开始等待最多 %d 秒以确认链上状态...",
             confirm_timeout,
         )
 
@@ -1229,7 +1231,7 @@ def _execute_second_leg(
             timeout_s=confirm_timeout,
             poll_interval_s=2,
         ):
-            # 第二步确认失败不算整体失败, 只记录警告
+            # 第 2 步确认失败不算整体失败, 只记录警告
             logger.warning(
                 "USDC->SOL 交易 %s 在 %d 秒内未能确认, 但交易已提交. ",
                 sig2,
@@ -1249,19 +1251,19 @@ def _execute_second_leg(
             )
 
             tx_logger.info(
-                "余额快照 阶段=第二步后 钱包_SOL_lamports=%d 钱包_SOL=%.9f 钱包_USDC_units=%d 钱包_USDC=%.6f",
+                "余额快照 阶段=第 2 步后 钱包_SOL_lamports=%d 钱包_SOL=%.9f 钱包_USDC_units=%d 钱包_USDC=%.6f",
                 sol_after_leg2,
                 sol_after_leg2 / 1_000_000_000,
                 usdc_after_leg2,
                 usdc_after_leg2 / 1_000_000,
             )
         except Exception as e:  # noqa: BLE001
-            logger.warning("获取第二步后钱包余额失败: %s", e)
+            logger.warning("获取第 2 步后钱包余额失败: %s", e)
 
     except Exception as e:  # noqa: BLE001
-        error_reason = f"第二步 USDC->SOL 交易失败: {e}"
+        error_reason = f"第 2 步 USDC->SOL 交易失败: {e}"
         logger.error(error_reason)
-        logger.debug("第二步交易异常堆栈:\n%s", traceback.format_exc())
+        logger.debug("第 2 步交易异常堆栈:\n%s", traceback.format_exc())
         return False, stats, error_reason
 
     return True, stats, None
@@ -1278,7 +1280,7 @@ def _execute_trade_pair_once(
 
     步骤:
     1. 使用配置中的 trade_amount (SOL 数量) 将 SOL 换成 USDC;
-    2. 等待第一步交易在链上确认;
+    2. 等待第 1 步交易在链上确认;
     3. 使用步骤 1 得到的 USDC 金额再换回 SOL. 
 
     任一步骤失败, 都会立即终止本次"一对交易", 并返回 (False, stats). 
@@ -1341,7 +1343,7 @@ def _execute_trade_pair_once(
     # 创建 requests Session
     http_session = requests.Session()
 
-    # -------- 执行第一步: SOL -> USDC --------
+    # -------- 执行第 1 步: SOL -> USDC --------
     first_ok, stats, error_reason, effective_usdc_amount = _execute_first_leg(
         cfg,
         client,
@@ -1363,7 +1365,7 @@ def _execute_trade_pair_once(
     # 以实际可用的 USDC 数量作为本次 USDC->SOL 的输入
     stats["usdc_spent_units"] = effective_usdc_amount
 
-    # -------- 执行第二步: USDC -> SOL --------
+    # -------- 执行第 2 步: USDC -> SOL --------
     second_ok, stats, error_reason = _execute_second_leg(
         cfg,
         client,
