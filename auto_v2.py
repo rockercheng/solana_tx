@@ -3,7 +3,7 @@
 """
 Solana 自动交易脚本 - V2 版本 (使用 Jupiter Swap API)
 
-功能特性：
+功能特性: 
 - 使用 Jupiter Swap API (GET /quote + POST /swap) 替代 Ultra API
 - 支持用户自定义 slippage_bps (滑点) 和 priority_fee (优先费)
 - 通过配置支持主网 / 测试网(如需 Devnet 可自行配置 rpc_url)
@@ -13,14 +13,14 @@ Solana 自动交易脚本 - V2 版本 (使用 Jupiter Swap API)
 - 所有错误都输出清晰易懂的日志(包含堆栈方便排查)
 
 
-使用说明(简要)：
-1. 安装依赖：
+使用说明(简要): 
+1. 安装依赖: 
    pip install -r requirements.txt
 2. 复制 config_example.json 为 config.json, 并按注释填写你的钱包信息
-3. 运行脚本：
+3. 运行脚本: 
    python auto_v2.py
 
-注意：本脚本仅为演示自动交易框架, 不构成任何投资建议. 
+注意: 本脚本仅为演示自动交易框架, 不构成任何投资建议. 
 在真实主网上使用前, 请务必在测试网充分验证、控制金额、了解风险. 
 """
 
@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import json
 import logging
-import logging.handlers
 import os
 import sys
 import time
@@ -44,7 +43,7 @@ from solders.transaction import VersionedTransaction
 from solders import message as solders_message
 from solders.pubkey import Pubkey
 from solana.rpc.api import Client
-from solana.rpc.types import TokenAccountOpts
+from solana.rpc.types import TokenAccountOpts, TxOpts
 
 # ===== 全局常量 =====
 # 主网 SOL (WSOL) Mint 地址
@@ -75,26 +74,73 @@ class AppConfig:
     rpc_url: str
     private_key: str  # Base58 编码的私钥字符串
     from_pubkey: Optional[str]
-    to_pubkey: str
     trade_mode: str  # "SOL_TO_USDC" 或 "USDC_TO_SOL"
     trade_amount_min: float
     trade_amount_max: float
     tx_interval_s: int
     enable_trading: bool
     max_runs: int
-    retry_max_attempts: int  # 外部 HTTP/RPC 调用的最大重试次数
-    retry_sleep_s: int  # 外部 HTTP/RPC 重试间隔秒数
-    slippage_bps: int  # Swap API 使用的滑点(单位：bps, 50 = 0.5%)
-    priority_fee: int  # Swap API 使用的优先费(单位：lamports)
+    retry_max_attempts: int  # 交易失败时的最大重试次数
+    retry_sleep_s: int  # 交易重试间隔秒数
+    slippage_bps: int  # Swap API 使用的滑点(单位: bps, 50 = 0.5%)
+    priority_fee: int  # Swap API 使用的优先费(单位: lamports)
+
+
+def _backup_log_file_if_exists(log_path: str) -> Optional[str]:
+    """如果日志文件存在且不为空, 则备份为带时间戳的文件.
+    
+    Args:
+        log_path: 日志文件路径
+        
+    Returns:
+        备份后的文件路径, 如果没有备份则返回 None
+    """
+    if not os.path.exists(log_path):
+        return None
+    
+    # 检查文件是否为空
+    if os.path.getsize(log_path) == 0:
+        return None
+    
+    # 获取文件的修改时间作为备份时间戳
+    mtime = os.path.getmtime(log_path)
+    from datetime import datetime
+    timestamp = datetime.fromtimestamp(mtime).strftime("%Y%m%d_%H%M%S")
+    
+    # 构造备份文件名: app_v2.log -> app_v2_20260207_134036.log
+    base_name = os.path.basename(log_path)
+    dir_name = os.path.dirname(log_path)
+    name_part, ext_part = os.path.splitext(base_name)
+    backup_name = f"{name_part}_{timestamp}{ext_part}"
+    backup_path = os.path.join(dir_name, backup_name)
+    
+    # 如果备份文件已存在(同一秒内多次运行), 添加序号
+    counter = 1
+    while os.path.exists(backup_path):
+        backup_name = f"{name_part}_{timestamp}_{counter}{ext_part}"
+        backup_path = os.path.join(dir_name, backup_name)
+        counter += 1
+    
+    # 重命名原文件为备份文件
+    os.rename(log_path, backup_path)
+    return backup_path
 
 
 def setup_logging(log_dir: str = "logs") -> tuple[logging.Logger, logging.Logger]:
     """初始化日志系统. 
-    - 主日志 logger：打印到控制台 + 写入 logs/app.log
-    - 交易日志 tx_logger：专门写入 logs/transactions.log
+    - 主日志 logger: 打印到控制台 + 写入 logs/app_v2.log
+    - 交易日志 tx_logger: 专门写入 logs/transactions_v2.log
+    - 每次运行前自动备份已存在的日志文件(加日期时间后缀)
     """
 
     os.makedirs(log_dir, exist_ok=True)
+    
+    # 备份已存在的日志文件
+    app_log_path = os.path.join(log_dir, "app_v2.log")
+    tx_log_path = os.path.join(log_dir, "transactions_v2.log")
+    
+    backup_app = _backup_log_file_if_exists(app_log_path)
+    backup_tx = _backup_log_file_if_exists(tx_log_path)
 
     # 主日志
     logger = logging.getLogger("solana_auto_v2")
@@ -109,11 +155,10 @@ def setup_logging(log_dir: str = "logs") -> tuple[logging.Logger, logging.Logger
     console_handler.setFormatter(log_format)
     logger.addHandler(console_handler)
 
-    # 文件日志(包含 DEBUG 级别)
-    file_handler = logging.handlers.RotatingFileHandler(
-        os.path.join(log_dir, "app_v2.log"),
-        maxBytes=5 * 1024 * 1024,  # 5 MB
-        backupCount=5,
+    # 文件日志(包含 DEBUG 级别) - 不再使用 RotatingFileHandler, 每次运行使用新文件
+    file_handler = logging.FileHandler(
+        app_log_path,
+        mode="w",  # 覆盖模式, 因为旧文件已备份
         encoding="utf-8",
     )
     file_handler.setLevel(logging.DEBUG)
@@ -126,15 +171,21 @@ def setup_logging(log_dir: str = "logs") -> tuple[logging.Logger, logging.Logger
     tx_logger.handlers.clear()
     tx_logger.propagate = False  # 禁止日志向上传播到父 logger, 避免重复输出
 
-    tx_file_handler = logging.handlers.RotatingFileHandler(
-        os.path.join(log_dir, "transactions_v2.log"),
-        maxBytes=5 * 1024 * 1024,
-        backupCount=5,
+    tx_file_handler = logging.FileHandler(
+        tx_log_path,
+        mode="w",  # 覆盖模式, 因为旧文件已备份
         encoding="utf-8",
     )
     tx_file_handler.setLevel(logging.INFO)
     tx_file_handler.setFormatter(log_format)
     tx_logger.addHandler(tx_file_handler)
+    
+    # 输出备份信息到日志
+    if backup_app:
+        logger.info("已备份上次运行日志: %s", os.path.basename(backup_app))
+    if backup_tx:
+        logger.info("已备份上次交易日志: %s", os.path.basename(backup_tx))
+    
     return logger, tx_logger
 
 
@@ -142,7 +193,7 @@ def load_config(path: str) -> AppConfig:
     """从 JSON 文件加载配置, 并做基本校验和默认值处理. """
 
     if not os.path.exists(path):
-        raise FileNotFoundError(f"配置文件不存在：{path}, 请先复制 config_example.json 为 {path} 并按说明填写. ")
+        raise FileNotFoundError(f"配置文件不存在: {path}, 请先复制 config_example.json 为 {path} 并按说明填写. ")
 
     with open(path, "r", encoding="utf-8") as f:
         raw = json.load(f)
@@ -150,7 +201,7 @@ def load_config(path: str) -> AppConfig:
     # 网络类型
     network = raw.get("network", "testnet").lower()
 
-    # RPC URL：可以显式配置, 也可以根据 network 自动选择
+    # RPC URL: 可以显式配置, 也可以根据 network 自动选择
     rpc_url = raw.get("rpc_url")
     if not rpc_url:
         if network == "mainnet":
@@ -158,15 +209,12 @@ def load_config(path: str) -> AppConfig:
         elif network == "testnet":
             rpc_url = DEFAULT_TESTNET_RPC_URL
         else:
-            raise ValueError(f"未知 network 类型：{network}, 请使用 mainnet / testnet 之一. ")
+            raise ValueError(f"未知 network 类型: {network}, 请使用 mainnet / testnet 之一. ")
 
 
     # 必填字段简单校验
     if "private_key" not in raw:
         raise ValueError("配置文件中缺少 private_key 字段(Base58 编码的私钥字符串). ")
-
-    if "to_pubkey" not in raw:
-        raise ValueError("配置文件中缺少 to_pubkey 字段(交易接收方地址). ")
 
     if "max_runs" not in raw:
         raise ValueError("配置文件中缺少 max_runs 字段 (必须是大于 0 的整数). ")
@@ -206,14 +254,14 @@ def load_config(path: str) -> AppConfig:
             f"配置项 trade_amount_min={trade_amount_min} 大于 trade_amount_max={trade_amount_max}, 请填写正确的范围. "
         )
 
-    # 外部 HTTP/RPC 调用的重试策略
+    # 重试策略配置
     retry_max_attempts = int(raw.get("retry_max_attempts", 10))
     retry_sleep_s = int(raw.get("retry_sleep_s", 2))
 
     # Swap API 相关配置
-    # slippage_bps: 滑点 (单位：bps, 50 = 0.5%, 100 = 1%)
-    slippage_bps = int(raw.get("slippage_bps", 50))
-    # priority_fee: 优先费 (单位：lamports, 10000 = 0.00001 SOL)
+    # slippage_bps: 滑点 (单位: bps, 50 = 0.5%, 100 = 1%)
+    slippage_bps = int(raw.get("slippage_bps", 20))
+    # priority_fee: 优先费 (单位: lamports, 10000 = 0.00001 SOL)
     priority_fee = int(raw.get("priority_fee", 10000))
 
     cfg = AppConfig(
@@ -221,7 +269,6 @@ def load_config(path: str) -> AppConfig:
         rpc_url=rpc_url,
         private_key=str(raw["private_key"]),
         from_pubkey=raw.get("from_pubkey") or None,
-        to_pubkey=str(raw["to_pubkey"]),
         trade_mode=trade_mode_raw,
         trade_amount_min=trade_amount_min,
         trade_amount_max=trade_amount_max,
@@ -237,7 +284,7 @@ def load_config(path: str) -> AppConfig:
 
 
 def random_trade_amount_sol(cfg: AppConfig) -> float:
-    """在 trade_amount_min / trade_amount_max 范围内随机选择本次交易的 SOL 数量(单位：SOL). """
+    """在 trade_amount_min / trade_amount_max 范围内随机选择本次交易的 SOL 数量(单位: SOL). """
     trade_amount_sol_raw = random.uniform(cfg.trade_amount_min, cfg.trade_amount_max)
     trade_amount_sol = round(trade_amount_sol_raw, 3)
     return trade_amount_sol
@@ -255,7 +302,7 @@ def load_keypair_from_base58(secret: str) -> Keypair:
         return Keypair.from_base58_string(secret_stripped)
     except Exception as e:  # noqa: BLE001 - 需要捕获所有错误并给出清晰提示
         raise ValueError(
-            "私钥格式错误：请确认是 Base58 编码的 Solana 私钥字符串, 且不要包含多余空格或换行. "
+            "私钥格式错误: 请确认是 Base58 编码的 Solana 私钥字符串, 且不要包含多余空格或换行. "
         ) from e
 
 
@@ -362,7 +409,7 @@ def http_request_with_retry(
                 lower_msg = last_resp_text.lower()
                 if ("insufficient" in lower_msg and "fund" in lower_msg) or ("余额不足" in last_resp_text):
                     logger.error("%s失败, 检测到可能的余额不足: %s", label, last_resp_text)
-                    raise RuntimeError(f"{label}失败：余额不足或资金不足. ")
+                    raise RuntimeError(f"{label}失败: 余额不足或资金不足. ")
 
             if attempt >= max_attempts:
                 logger.error(
@@ -738,12 +785,16 @@ def swap_get_quote(
         quoteResponse 对象, 用于后续 /swap 请求
     """
     
+    # 使用更大的滑点进行询价, 以提高交易成功率
+    # 至少使用 300 bps (3%) 或用户配置值的 2 倍
+    effective_slippage = max(cfg.slippage_bps * 2, 300)
+    
     quote_url = (
         f"{JUPITER_SWAP_API_BASE}/quote"
         f"?inputMint={input_mint}"
         f"&outputMint={output_mint}"
         f"&amount={amount}"
-        f"&slippageBps={cfg.slippage_bps}"
+        f"&slippageBps={effective_slippage}"
     )
     
     headers = {
@@ -781,9 +832,10 @@ def swap_get_quote(
         raise RuntimeError(f"询价 返回的 outAmount 无效: {quote_response.get('outAmount')}")
     
     logger.info(
-        "询价 成功: 输入=%d, 预计输出=%d, 滑点=%d bps",
+        "询价 成功: 输入=%d, 预计输出=%d, 有效滑点=%d bps (配置=%d bps)",
         amount,
         out_amount,
+        effective_slippage,
         cfg.slippage_bps,
     )
     
@@ -822,6 +874,8 @@ def swap_build_transaction(
         "prioritizationFeeLamports": cfg.priority_fee,  # 直接使用固定 lamports 值
         "dynamicComputeUnitLimit": True,  # 启用动态计算单元限制, 优化费用
         "wrapAndUnwrapSol": True,  # 自动处理 SOL/WSOL 转换
+        # 注意: dynamicSlippage 已被 Jupiter 标记为不再维护, 所以不使用
+        # 滑点由 quoteResponse 中的 slippageBps 控制
     }
     
     logger.debug(
@@ -871,6 +925,75 @@ def swap_build_transaction(
     return swap_tx_base64, last_valid_block_height
 
 
+def _extract_solana_error_details(e: Exception, logger: logging.Logger) -> str:
+    """从 Solana 交易异常中提取详细错误信息. 
+    
+    尝试从异常对象中提取:
+    - err: 错误代码/类型
+    - message: 错误消息
+    - logs: 程序日志
+    - data: 错误数据
+    """
+    error_parts = []
+    
+    # 1. 基础错误字符串
+    error_str = str(e)
+    
+    # 2. 尝试从异常属性中提取详细信息
+    try:
+        # 检查是否有 err 属性 (常见于 RPC 错误)
+        if hasattr(e, "err"):
+            err_val = getattr(e, "err", None)
+            if err_val:
+                error_parts.append(f"err={err_val}")
+        
+        # 检查是否有 message 属性
+        if hasattr(e, "message"):
+            msg_val = getattr(e, "message", None)
+            if msg_val:
+                error_parts.append(f"message={msg_val}")
+        
+        # 检查是否有 data 属性 (可能包含 logs)
+        if hasattr(e, "data"):
+            data_val = getattr(e, "data", None)
+            if data_val:
+                # 如果 data 是字典，提取关键信息
+                if isinstance(data_val, dict):
+                    if "err" in data_val:
+                        error_parts.append(f"data.err={data_val['err']}")
+                    if "logs" in data_val:
+                        logs = data_val["logs"]
+                        # 只取最后几行日志
+                        if isinstance(logs, list) and logs:
+                            last_logs = logs[-5:] if len(logs) > 5 else logs
+                            error_parts.append(f"logs={last_logs}")
+                else:
+                    error_parts.append(f"data={data_val}")
+        
+        # 检查是否有 logs 属性
+        if hasattr(e, "logs"):
+            logs_val = getattr(e, "logs", None)
+            if logs_val and isinstance(logs_val, list):
+                last_logs = logs_val[-5:] if len(logs_val) > 5 else logs_val
+                error_parts.append(f"logs={last_logs}")
+        
+        # 检查 __dict__ 中是否有额外信息
+        if hasattr(e, "__dict__"):
+            for key, val in e.__dict__.items():
+                if key not in ("err", "message", "data", "logs", "args") and val:
+                    error_parts.append(f"{key}={val}")
+        
+    except Exception as extract_err:  # noqa: BLE001
+        logger.debug("提取 Solana 错误详情时发生异常: %s", extract_err)
+    
+    # 3. 组合错误信息
+    if error_parts:
+        detail_str = ", ".join(error_parts)
+        return f"{error_str} [详情: {detail_str}]"
+    else:
+        return error_str
+
+
 def swap_sign_and_send(
     cfg: AppConfig,
     client: Client,
@@ -909,9 +1032,13 @@ def swap_sign_and_send(
     logger.debug("交易签名完成")
     
     # 3. 通过 Solana RPC 发送交易
+    # 使用 skip_preflight=True 跳过预检查，因为预检查时的价格可能已变化导致滑点错误
     try:
         signed_tx_bytes = bytes(signed_tx)
-        response = client.send_raw_transaction(signed_tx_bytes)
+        # 跳过 preflight 检查，直接发送到链上
+        # 这可以避免因预检查时价格变化导致的假滑点错误
+        tx_opts = TxOpts(skip_preflight=True, skip_confirmation=True)
+        response = client.send_raw_transaction(signed_tx_bytes, opts=tx_opts)
         
         # 提取交易签名
         if hasattr(response, "value"):
@@ -927,9 +1054,10 @@ def swap_sign_and_send(
         
         return tx_signature
     except Exception as e:
-        logger.error("发送 Swap 交易失败: %s", e)
-        logger.debug("发送交易异常堆栈:\n%s", traceback.format_exc())
-        raise RuntimeError(f"发送 Swap 交易失败: {e}") from e
+        # 提取详细错误信息
+        error_details = _extract_solana_error_details(e, logger)
+        logger.error("发送 Swap 交易失败: %s", error_details)
+        raise RuntimeError(f"发送 Swap 交易失败: {error_details}") from e
 
 
 # ========================== 交易执行逻辑 ==========================
@@ -1031,7 +1159,6 @@ def _execute_first_leg(
     except Exception as e:  # noqa: BLE001
         error_reason = f"第 1 步 SOL->USDC 交易失败: {e}"
         logger.error(error_reason)
-        logger.debug("第 1 步交易异常堆栈:\n%s", traceback.format_exc())
         return False, stats, error_reason, None
 
     # -------- 等待第 1 步交易链上确认 --------
@@ -1216,7 +1343,7 @@ def _execute_second_leg(
             net_sol,
         )
 
-        # 等待第 2 步交易确认 (可选, 但建议等待以获取准确余额)
+        # 等待第 2 步交易确认 (必须等待确认成功才算交易完成)
         confirm_timeout = max(cfg.tx_interval_s, 20)
         logger.info(
             "第 2 步 USDC->SOL 交易已提交, 开始等待最多 %d 秒以确认链上状态...",
@@ -1231,12 +1358,14 @@ def _execute_second_leg(
             timeout_s=confirm_timeout,
             poll_interval_s=2,
         ):
-            # 第 2 步确认失败不算整体失败, 只记录警告
-            logger.warning(
-                "USDC->SOL 交易 %s 在 %d 秒内未能确认, 但交易已提交. ",
+            # 第 2 步确认失败, 需要重试
+            error_reason = f"USDC->SOL 交易 {sig2} 链上确认失败或超时"
+            logger.error(
+                "USDC->SOL 交易 %s 在 %d 秒内未能确认成功, 将触发重试. ",
                 sig2,
                 confirm_timeout,
             )
+            return False, stats, error_reason
 
         # 记录第二笔交易完成后的钱包余额
         try:
@@ -1263,7 +1392,6 @@ def _execute_second_leg(
     except Exception as e:  # noqa: BLE001
         error_reason = f"第 2 步 USDC->SOL 交易失败: {e}"
         logger.error(error_reason)
-        logger.debug("第 2 步交易异常堆栈:\n%s", traceback.format_exc())
         return False, stats, error_reason
 
     return True, stats, None
@@ -1292,6 +1420,14 @@ def _execute_trade_pair_once(
         "usdc_received_units": 0,
         "usdc_spent_units": 0,
         "sol_bought_lamports": 0,
+        # 第 1 步 SOL->USDC 交易统计
+        "step1_exec_count": 0,  # 执行次数(含重试)
+        "step1_success_count": 0,  # 成功次数
+        "step1_fail_count": 0,  # 失败次数
+        # 第 2 步 USDC->SOL 交易统计
+        "step2_exec_count": 0,  # 执行次数(含重试)
+        "step2_success_count": 0,  # 成功次数
+        "step2_fail_count": 0,  # 失败次数
     }
 
     error_reason: Optional[str] = None
@@ -1317,7 +1453,7 @@ def _execute_trade_pair_once(
     # 钱包公钥
     wallet_pubkey = str(keypair.pubkey())
 
-    # 为本次一对交易随机生成 SOL 卖出数量(单位：SOL), 只保留 3 位小数
+    # 为本次一对交易随机生成 SOL 卖出数量(单位: SOL), 只保留 3 位小数
     trade_amount_sol = random_trade_amount_sol(cfg)
     trade_amount_sol_display = trade_amount_sol
 
@@ -1343,42 +1479,93 @@ def _execute_trade_pair_once(
     # 创建 requests Session
     http_session = requests.Session()
 
-    # -------- 执行第 1 步: SOL -> USDC --------
-    first_ok, stats, error_reason, effective_usdc_amount = _execute_first_leg(
-        cfg,
-        client,
-        keypair,
-        logger,
-        tx_logger,
-        stats,
-        http_session,
-        wallet_pubkey,
-        sol_mint,
-        usdc_mint,
-        trade_amount_sol_display,
-        amount_sol_lamports,
-    )
+    # -------- 执行第 1 步: SOL -> USDC (带重试) --------
+    first_ok = False
+    effective_usdc_amount: Optional[int] = None
+    for attempt in range(1, cfg.retry_max_attempts + 1):
+        stats["step1_exec_count"] += 1  # 记录执行次数
+        first_ok, stats, error_reason, effective_usdc_amount = _execute_first_leg(
+            cfg,
+            client,
+            keypair,
+            logger,
+            tx_logger,
+            stats,
+            http_session,
+            wallet_pubkey,
+            sol_mint,
+            usdc_mint,
+            trade_amount_sol_display,
+            amount_sol_lamports,
+        )
+
+        if first_ok:
+            stats["step1_success_count"] += 1  # 记录成功次数
+            break  # 第 1 步成功，跳出重试循环
+
+        # 第 1 步失败
+        stats["step1_fail_count"] += 1  # 记录失败次数
+        # 判断是否需要重试
+        if attempt < cfg.retry_max_attempts:
+            logger.warning(
+                "第 1 步 SOL->USDC 交易失败(第 %d/%d 次尝试), %d 秒后重试...",
+                attempt,
+                cfg.retry_max_attempts,
+                cfg.retry_sleep_s,
+            )
+            time.sleep(cfg.retry_sleep_s)
+        else:
+            logger.error(
+                "第 1 步 SOL->USDC 交易失败(已尝试 %d 次), 放弃本次一对交易",
+                cfg.retry_max_attempts,
+            )
 
     if not first_ok:
         return False, stats, error_reason
 
     # 以实际可用的 USDC 数量作为本次 USDC->SOL 的输入
+    # 此时 effective_usdc_amount 一定不为 None（因为 first_ok 为 True）
+    assert effective_usdc_amount is not None, "第 1 步成功但 effective_usdc_amount 为 None"
     stats["usdc_spent_units"] = effective_usdc_amount
 
-    # -------- 执行第 2 步: USDC -> SOL --------
-    second_ok, stats, error_reason = _execute_second_leg(
-        cfg,
-        client,
-        keypair,
-        logger,
-        tx_logger,
-        stats,
-        http_session,
-        wallet_pubkey,
-        sol_mint,
-        usdc_mint,
-        effective_usdc_amount,
-    )
+    # -------- 执行第 2 步: USDC -> SOL (带重试) --------
+    second_ok = False
+    for attempt in range(1, cfg.retry_max_attempts + 1):
+        stats["step2_exec_count"] += 1  # 记录执行次数
+        second_ok, stats, error_reason = _execute_second_leg(
+            cfg,
+            client,
+            keypair,
+            logger,
+            tx_logger,
+            stats,
+            http_session,
+            wallet_pubkey,
+            sol_mint,
+            usdc_mint,
+            effective_usdc_amount,
+        )
+
+        if second_ok:
+            stats["step2_success_count"] += 1  # 记录成功次数
+            break  # 第 2 步成功，跳出重试循环
+
+        # 第 2 步失败
+        stats["step2_fail_count"] += 1  # 记录失败次数
+        # 判断是否需要重试
+        if attempt < cfg.retry_max_attempts:
+            logger.warning(
+                "第 2 步 USDC->SOL 交易失败(第 %d/%d 次尝试), %d 秒后重试...",
+                attempt,
+                cfg.retry_max_attempts,
+                cfg.retry_sleep_s,
+            )
+            time.sleep(cfg.retry_sleep_s)
+        else:
+            logger.error(
+                "第 2 步 USDC->SOL 交易失败(已尝试 %d 次), 放弃本次一对交易",
+                cfg.retry_max_attempts,
+            )
 
     if not second_ok:
         return False, stats, error_reason
@@ -1408,7 +1595,6 @@ def execute_trade_pair(
 
     except Exception as e:  # noqa: BLE001
         logger.error("执行一对交易时发生未捕获异常: %s", e)
-        logger.debug("一对交易执行异常堆栈：\n%s", traceback.format_exc())
         return False, {
             "sol_spent_lamports": 0,
             "usdc_received_units": 0,
@@ -1452,6 +1638,13 @@ def run_trading_loop(
     total_usdc_received_units = 0
     total_usdc_spent_units = 0
     total_sol_bought_lamports = 0
+    # 本轮交易步骤统计
+    total_step1_exec_count = 0  # SOL->USDC 执行次数
+    total_step1_success_count = 0  # SOL->USDC 成功次数
+    total_step1_fail_count = 0  # SOL->USDC 失败次数
+    total_step2_exec_count = 0  # USDC->SOL 执行次数
+    total_step2_success_count = 0  # USDC->SOL 成功次数
+    total_step2_fail_count = 0  # USDC->SOL 失败次数
 
     while success_pairs < cfg.max_runs:
         try:
@@ -1466,6 +1659,12 @@ def run_trading_loop(
                     "usdc_received_units": 0,
                     "usdc_spent_units": 0,
                     "sol_bought_lamports": 0,
+                    "step1_exec_count": 0,
+                    "step1_success_count": 0,
+                    "step1_fail_count": 0,
+                    "step2_exec_count": 0,
+                    "step2_success_count": 0,
+                    "step2_fail_count": 0,
                 }
                 pair_error = None
             else:
@@ -1508,8 +1707,22 @@ def run_trading_loop(
                         "usdc_received_units": 0,
                         "usdc_spent_units": 0,
                         "sol_bought_lamports": 0,
+                        "step1_exec_count": 0,
+                        "step1_success_count": 0,
+                        "step1_fail_count": 0,
+                        "step2_exec_count": 0,
+                        "step2_success_count": 0,
+                        "step2_fail_count": 0,
                     }
                     pair_error = f"获取一对交易开始前钱包余额失败: {e}"
+
+            # 无论一对交易成功与否，都累加交易步骤统计
+            total_step1_exec_count += int(pair_stats.get("step1_exec_count", 0))
+            total_step1_success_count += int(pair_stats.get("step1_success_count", 0))
+            total_step1_fail_count += int(pair_stats.get("step1_fail_count", 0))
+            total_step2_exec_count += int(pair_stats.get("step2_exec_count", 0))
+            total_step2_success_count += int(pair_stats.get("step2_success_count", 0))
+            total_step2_fail_count += int(pair_stats.get("step2_fail_count", 0))
 
             if pair_ok:
                 # 累加本轮统计数据
@@ -1552,8 +1765,7 @@ def run_trading_loop(
             break
         except Exception as e:  # noqa: BLE001
             # 兜底异常处理, 保证任何异常都有清晰日志
-            logger.error("主循环中出现未捕获异常：%s", e)
-            logger.debug("主循环未捕获异常堆栈：\n%s", traceback.format_exc())
+            logger.error("主循环中出现未捕获异常: %s", e)
             break
 
         if pair_ok:
@@ -1582,12 +1794,26 @@ def run_trading_loop(
 
     # 本轮运行结束后的统计输出
     if cfg.enable_trading:
+        # 计算 SOL 总变化量 (买回 - 花费)
+        sol_net_change_lamports = total_sol_bought_lamports - total_sol_spent_lamports
+        sol_net_change_display = sol_net_change_lamports / 1_000_000_000
+        # 格式化符号: 正数加 + 号, 负数自带 - 号
+        sol_change_sign = "+" if sol_net_change_lamports >= 0 else ""
+
         logger.info(
-            "本轮统计: 成功 %s 次数=%d, 初始花费 SOL 总数=%.9f SOL (lamports=%d), "
+            "本轮统计: 成功 %s 次数=%d, "
+            "SOL->USDC(执行=%d/成功=%d/失败=%d), USDC->SOL(执行=%d/成功=%d/失败=%d), "
+            "初始花费 SOL 总数=%.9f SOL (lamports=%d), "
             "获得 USDC 总数≈%.6f USDC (最小单位=%d), 花费 USDC 总数≈%.6f USDC (最小单位=%d), "
-            "最终买回 SOL 总数=%.9f SOL (lamports=%d). ",
+            "最终买回 SOL 总数=%.9f SOL (lamports=%d), SOL 总变化=%s%.9f SOL (lamports=%s%d). ",
             unit_label,
             success_pairs,
+            total_step1_exec_count,
+            total_step1_success_count,
+            total_step1_fail_count,
+            total_step2_exec_count,
+            total_step2_success_count,
+            total_step2_fail_count,
             total_sol_spent_lamports / 1_000_000_000 if total_sol_spent_lamports else 0.0,
             total_sol_spent_lamports,
             total_usdc_received_units / 1_000_000 if total_usdc_received_units else 0.0,
@@ -1596,13 +1822,25 @@ def run_trading_loop(
             total_usdc_spent_units,
             total_sol_bought_lamports / 1_000_000_000 if total_sol_bought_lamports else 0.0,
             total_sol_bought_lamports,
+            sol_change_sign,
+            sol_net_change_display,
+            sol_change_sign,
+            sol_net_change_lamports,
         )
         tx_logger.info(
-            "本轮统计: 成功 %s 次数=%d, 初始花费 SOL 总数=%.9f SOL (lamports=%d), "
+            "本轮统计: 成功 %s 次数=%d, "
+            "SOL->USDC(执行=%d/成功=%d/失败=%d), USDC->SOL(执行=%d/成功=%d/失败=%d), "
+            "初始花费 SOL 总数=%.9f SOL (lamports=%d), "
             "获得 USDC 总数≈%.6f USDC (最小单位=%d), 花费 USDC 总数≈%.6f USDC (最小单位=%d), "
-            "最终买回 SOL 总数=%.9f SOL (lamports=%d). ",
+            "最终买回 SOL 总数=%.9f SOL (lamports=%d), SOL 总变化=%s%.9f SOL (lamports=%s%d). ",
             unit_label,
             success_pairs,
+            total_step1_exec_count,
+            total_step1_success_count,
+            total_step1_fail_count,
+            total_step2_exec_count,
+            total_step2_success_count,
+            total_step2_fail_count,
             total_sol_spent_lamports / 1_000_000_000 if total_sol_spent_lamports else 0.0,
             total_sol_spent_lamports,
             total_usdc_received_units / 1_000_000 if total_usdc_received_units else 0.0,
@@ -1611,6 +1849,10 @@ def run_trading_loop(
             total_usdc_spent_units,
             total_sol_bought_lamports / 1_000_000_000 if total_sol_bought_lamports else 0.0,
             total_sol_bought_lamports,
+            sol_change_sign,
+            sol_net_change_display,
+            sol_change_sign,
+            sol_net_change_lamports,
         )
 
         if last_error_reason:
@@ -1630,22 +1872,24 @@ def run_trading_loop(
 
 
 def run_auto_trader() -> None:
-    """主入口：加载配置、初始化客户端并循环执行自动交易. """
+    """主入口: 加载配置、初始化客户端并循环执行自动交易. """
 
     logger, tx_logger = setup_logging()
+    logger.info("===================================================")
     logger.info("===== 启动 Solana 自动交易程序 (V2 - Swap API) =====")
+    logger.info("===================================================")
 
     # 1. 加载配置
     try:
         cfg = load_config(CONFIG_PATH)
     except Exception as e:  # noqa: BLE001
         # 配置相关错误通常是最常见的问题, 需要给用户极其清晰的提示
-        logger.error("加载配置失败：%s", e)
-        logger.debug("加载配置异常堆栈：\n%s", traceback.format_exc())
+        logger.error("加载配置失败: %s", e)
+        logger.debug("加载配置异常堆栈: \n%s", traceback.format_exc())
         return
 
     logger.info(
-        "当前配置：network=%s, rpc_url=%s, trade_amount_range=[%.9f, %.9f], tx_interval_s=%d, enable_trading=%s, max_runs=%d",
+        "当前配置: network=%s, rpc_url=%s, trade_amount_range=[%.9f, %.9f], tx_interval_s=%d, enable_trading=%s, max_runs=%d",
         cfg.network,
         cfg.rpc_url,
         cfg.trade_amount_min,
@@ -1655,7 +1899,7 @@ def run_auto_trader() -> None:
         cfg.max_runs,
     )
     logger.info(
-        "Swap API 配置：slippage_bps=%d (%.2f%%), priority_fee=%d lamports (%.6f SOL)",
+        "Swap API 配置: slippage_bps=%d (%.2f%%), priority_fee=%d lamports (%.6f SOL)",
         cfg.slippage_bps,
         cfg.slippage_bps / 100,
         cfg.priority_fee,
@@ -1666,12 +1910,12 @@ def run_auto_trader() -> None:
     try:
         keypair = load_keypair_from_base58(cfg.private_key)
     except Exception as e:  # noqa: BLE001
-        logger.error("加载私钥失败：%s", e)
-        logger.debug("加载私钥异常堆栈：\n%s", traceback.format_exc())
+        logger.error("加载私钥失败: %s", e)
+        logger.debug("加载私钥异常堆栈: \n%s", traceback.format_exc())
         return
 
     wallet_pubkey = str(keypair.pubkey())
-    logger.info("私钥加载成功, 钱包地址：%s", wallet_pubkey)
+    logger.info("私钥加载成功, 钱包地址: %s", wallet_pubkey)
 
 
     # 3. 初始化 RPC 客户端
@@ -1679,10 +1923,10 @@ def run_auto_trader() -> None:
         client = build_client(cfg)
         # 测试连通性
         version = client.get_version()
-        logger.info("RPC 连接成功, 节点版本信息：%s", version)
+        logger.info("RPC 连接成功, 节点版本信息: %s", version)
     except Exception as e:  # noqa: BLE001
-        logger.error("初始化 RPC 客户端或测试连接失败：%s", e)
-        logger.debug("RPC 初始化异常堆栈：\n%s", traceback.format_exc())
+        logger.error("初始化 RPC 客户端或测试连接失败: %s", e)
+        logger.debug("RPC 初始化异常堆栈: \n%s", traceback.format_exc())
         return
 
     # 4. 进入交易循环

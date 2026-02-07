@@ -20,7 +20,6 @@ Solana 自动交易程序 使用说明（面向最终用户）
    {
      "network": "testnet",
      "private_key": "你的私钥(Base58字符串)",
-     "to_pubkey": "你的目标钱包地址",
      "trade_amount_min": 0.02,
      "trade_amount_max": 0.07,
      "tx_interval_s": 60,
@@ -48,10 +47,6 @@ Solana 自动交易程序 使用说明（面向最终用户）
      - 不要将私钥泄露给任何人。
      - 不要把 config.json 上传到网络或公共仓库。
      - 建议只使用单独的小额钱包，用于测试和自动交易，不要使用主资金钱包。
-
-3. to_pubkey
-   - 说明：接收方钱包地址，用于部分兼容逻辑，目前不会实际转账给该地址，但必须填写一个合法地址。
-   - 建议：填写你自己的另一个钱包地址即可。
 
 4. trade_amount_min / trade_amount_max
    - 说明：每一笔 SOL->USDC 交易卖出的 SOL 数量范围。
