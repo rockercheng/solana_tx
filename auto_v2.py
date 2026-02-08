@@ -36,6 +36,7 @@ from dataclasses import dataclass
 from typing import Optional, Callable
 import base64
 import base58
+import hashlib
 import random
 import requests
 from solders.keypair import Keypair
@@ -46,6 +47,10 @@ from solana.rpc.api import Client
 from solana.rpc.types import TokenAccountOpts, TxOpts
 
 # ===== 全局常量 =====
+# Associated Token Program ID
+ASSOCIATED_TOKEN_PROGRAM_ID = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
+# Token Program ID
+TOKEN_PROGRAM_ID = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
 # 主网 SOL (WSOL) Mint 地址
 SOL_MINT = "So11111111111111111111111111111111111111112"
 # 主网 USDC Mint 地址
@@ -57,6 +62,7 @@ JUPITER_SWAP_API_BASE = "https://api.jup.ag/swap/v1"
 SWAP_API_KEY = "72675114-cb71-4b8b-8c21-c429b1082843"
 
 # 默认 RPC URL 常量, 便于集中管理和修改
+# 备用 "rpc_url": "https://api.mainnet-beta.solana.com",
 DEFAULT_MAINNET_RPC_URL = "https://solana-rpc.publicnode.com"
 DEFAULT_TESTNET_RPC_URL = "https://solana-testnet.api.onfinality.io/public"
 
@@ -66,12 +72,59 @@ DEFAULT_CONFIG_PATH = "config.json"
 CONFIG_PATH = os.environ.get("SOLANA_AUTO_CONFIG", DEFAULT_CONFIG_PATH)
 
 
+class RpcUrlManager:
+    """RPC URL 管理器，支持多个 URL 轮换和失败统计。"""
+    
+    def __init__(self, urls: list[str], logger: logging.Logger):
+        self.urls = urls
+        self.logger = logger
+        self.current_index = 0
+        # 记录每个 URL 的失败次数
+        self.fail_counts: dict[str, int] = {}
+    
+    @property
+    def current_url(self) -> str:
+        """获取当前使用的 RPC URL。"""
+        return self.urls[self.current_index]
+    
+    def switch_to_next(self) -> str:
+        """切换到下一个 RPC URL，返回新的 URL。"""
+        if len(self.urls) <= 1:
+            return self.current_url
+        
+        old_url = self.current_url
+        self.current_index = (self.current_index + 1) % len(self.urls)
+        new_url = self.current_url
+        self.logger.info("切换 RPC URL: %s -> %s", self._short_url(old_url), self._short_url(new_url))
+        return new_url
+    
+    def record_failure(self, url: Optional[str] = None) -> None:
+        """记录指定 URL 的失败次数。如果未指定则记录当前 URL。"""
+        if url is None:
+            url = self.current_url
+        self.fail_counts[url] = self.fail_counts.get(url, 0) + 1
+    
+    def get_fail_stats(self) -> dict[str, int]:
+        """获取有失败记录的 URL 统计（过滤掉失败次数为 0 的）。"""
+        return {url: count for url, count in self.fail_counts.items() if count > 0}
+    
+    def _short_url(self, url: str) -> str:
+        """返回 URL 的简短形式，便于日志显示。"""
+        # 提取域名部分
+        try:
+            from urllib.parse import urlparse
+            parsed = urlparse(url)
+            return parsed.netloc
+        except Exception:
+            return url[:50] + "..." if len(url) > 50 else url
+
+
 @dataclass
 class AppConfig:
     """应用配置对象, 便于在代码中类型提示和访问字段. """
 
     network: str  # mainnet / testnet
-    rpc_url: str
+    rpc_urls: list[str]  # RPC URL 列表，支持多个 URL 轮换
     private_key: str  # Base58 编码的私钥字符串
     from_pubkey: Optional[str]
     trade_mode: str  # "SOL_TO_USDC" 或 "USDC_TO_SOL"
@@ -84,6 +137,11 @@ class AppConfig:
     retry_sleep_s: int  # 交易重试间隔秒数
     slippage_bps: int  # Swap API 使用的滑点(单位: bps, 50 = 0.5%)
     priority_fee: int  # Swap API 使用的优先费(单位: lamports)
+    
+    @property
+    def rpc_url(self) -> str:
+        """兼容属性：返回第一个 RPC URL。"""
+        return self.rpc_urls[0] if self.rpc_urls else DEFAULT_MAINNET_RPC_URL
 
 
 def _backup_log_file_if_exists(log_path: str) -> Optional[str]:
@@ -201,13 +259,27 @@ def load_config(path: str) -> AppConfig:
     # 网络类型
     network = raw.get("network", "testnet").lower()
 
-    # RPC URL: 可以显式配置, 也可以根据 network 自动选择
-    rpc_url = raw.get("rpc_url")
-    if not rpc_url:
+    # RPC URL 列表: 支持 rpc_urls (列表) 或 rpc_url (单个字符串) 两种配置方式
+    rpc_urls_raw = raw.get("rpc_urls")
+    rpc_url_single = raw.get("rpc_url")
+    
+    rpc_urls: list[str] = []
+    if rpc_urls_raw:
+        # 优先使用 rpc_urls 列表
+        if isinstance(rpc_urls_raw, list):
+            rpc_urls = [url.strip() for url in rpc_urls_raw if url and url.strip()]
+        elif isinstance(rpc_urls_raw, str):
+            rpc_urls = [rpc_urls_raw.strip()]
+    elif rpc_url_single:
+        # 兼容旧的 rpc_url 单字符串配置
+        rpc_urls = [rpc_url_single.strip()]
+    
+    # 如果没有配置任何 RPC URL，使用默认值
+    if not rpc_urls:
         if network == "mainnet":
-            rpc_url = DEFAULT_MAINNET_RPC_URL
+            rpc_urls = [DEFAULT_MAINNET_RPC_URL]
         elif network == "testnet":
-            rpc_url = DEFAULT_TESTNET_RPC_URL
+            rpc_urls = [DEFAULT_TESTNET_RPC_URL]
         else:
             raise ValueError(f"未知 network 类型: {network}, 请使用 mainnet / testnet 之一. ")
 
@@ -266,7 +338,7 @@ def load_config(path: str) -> AppConfig:
 
     cfg = AppConfig(
         network=network,
-        rpc_url=rpc_url,
+        rpc_urls=rpc_urls,
         private_key=str(raw["private_key"]),
         from_pubkey=raw.get("from_pubkey") or None,
         trade_mode=trade_mode_raw,
@@ -437,6 +509,88 @@ def http_request_with_retry(
     raise RuntimeError(f"{label}失败, HTTP {getattr(resp, 'status_code', '未知')}: {last_resp_text}")
 
 
+# ===== ATA 地址缓存 =====
+# 缓存已计算的 Associated Token Account 地址，避免重复计算
+# key: (owner_pubkey, mint) -> value: ata_address
+_ata_address_cache: dict[tuple[str, str], str] = {}
+
+
+def get_associated_token_address(owner_pubkey: str, mint: str) -> str:
+    """计算 Associated Token Account (ATA) 地址.
+    
+    ATA 是通过 PDA (Program Derived Address) 派生的确定性地址，
+    使用 owner + mint + token_program 作为种子。
+    
+    Args:
+        owner_pubkey: 钱包所有者公钥 (Base58)
+        mint: 代币 Mint 地址 (Base58)
+        
+    Returns:
+        ATA 地址 (Base58)
+    """
+    cache_key = (owner_pubkey, mint)
+    
+    # 检查缓存
+    if cache_key in _ata_address_cache:
+        return _ata_address_cache[cache_key]
+    
+    # 计算 PDA
+    # Seeds: [owner_pubkey, token_program_id, mint]
+    owner_bytes = base58.b58decode(owner_pubkey)
+    token_program_bytes = base58.b58decode(TOKEN_PROGRAM_ID)
+    mint_bytes = base58.b58decode(mint)
+    associated_program_bytes = base58.b58decode(ASSOCIATED_TOKEN_PROGRAM_ID)
+    
+    # PDA 派生: sha256(seeds + program_id + "ProgramDerivedAddress")
+    # 尝试从 bump = 255 开始递减，直到找到一个不在 ed25519 曲线上的点
+    for bump in range(255, -1, -1):
+        seeds = owner_bytes + token_program_bytes + mint_bytes + bytes([bump]) + associated_program_bytes + b"ProgramDerivedAddress"
+        hash_result = hashlib.sha256(seeds).digest()
+        
+        # 检查是否在曲线上（简化检查：尝试解码为公钥）
+        try:
+            # 如果能成功创建 Pubkey，说明在曲线上，需要继续尝试
+            Pubkey.from_bytes(hash_result)
+            continue
+        except Exception:
+            # 不在曲线上，这是有效的 PDA
+            ata_address = base58.b58encode(hash_result).decode("utf-8")
+            _ata_address_cache[cache_key] = ata_address
+            return ata_address
+    
+    raise RuntimeError(f"无法计算 ATA 地址: owner={owner_pubkey}, mint={mint}")
+
+
+def get_ata_address_via_solders(owner_pubkey: str, mint: str) -> str:
+    """使用 solders 库计算 ATA 地址（更可靠的方法）.
+    
+    Args:
+        owner_pubkey: 钱包所有者公钥 (Base58)
+        mint: 代币 Mint 地址 (Base58)
+        
+    Returns:
+        ATA 地址 (Base58)
+    """
+    cache_key = (owner_pubkey, mint)
+    
+    # 检查缓存
+    if cache_key in _ata_address_cache:
+        return _ata_address_cache[cache_key]
+    
+    owner_pk = Pubkey.from_string(owner_pubkey)
+    mint_pk = Pubkey.from_string(mint)
+    token_program_pk = Pubkey.from_string(TOKEN_PROGRAM_ID)
+    associated_program_pk = Pubkey.from_string(ASSOCIATED_TOKEN_PROGRAM_ID)
+    
+    # 使用 Pubkey.find_program_address 计算 PDA
+    seeds = [bytes(owner_pk), bytes(token_program_pk), bytes(mint_pk)]
+    ata_pk, _bump = Pubkey.find_program_address(seeds, associated_program_pk)
+    
+    ata_address = str(ata_pk)
+    _ata_address_cache[cache_key] = ata_address
+    return ata_address
+
+
 def get_usdc_balance(
     client: Client,
     owner_pubkey: str,
@@ -448,7 +602,8 @@ def get_usdc_balance(
 ) -> int:
     """查询指定钱包当前的 USDC 余额(最小单位).
 
-    直接使用原始 JSON-RPC 调用, 并带有重试和解析容错.
+    使用 getTokenAccountBalance API 查询 ATA 账户余额.
+    ATA 地址会被缓存，避免重复计算.
     """
 
     # 如果未显式传入 rpc_url, 则尝试从 client 中获取
@@ -462,22 +617,29 @@ def get_usdc_balance(
         # 无法获得 RPC 地址, 只能把异常抛出去
         raise RuntimeError("获取 USDC 余额失败: 无法确定 RPC URL")
 
-    # 显式指定 commitment: "confirmed" 确保读取已确认的数据
+    # 计算 ATA 地址（会使用缓存）
+    try:
+        ata_address = get_ata_address_via_solders(owner_pubkey, usdc_mint)
+        logger.debug("USDC ATA 地址: %s (owner=%s)", ata_address, owner_pubkey)
+    except Exception as e:
+        logger.error("计算 USDC ATA 地址失败: %s", e)
+        raise RuntimeError(f"计算 USDC ATA 地址失败: {e}") from e
+
+    # 使用 getTokenAccountBalance 查询余额
     payload = {
         "jsonrpc": "2.0",
         "id": 1,
-        "method": "getTokenAccountsByOwner",
+        "method": "getTokenAccountBalance",
         "params": [
-            owner_pubkey,
-            {"mint": usdc_mint},
-            {"encoding": "jsonParsed", "commitment": "confirmed"},
+            ata_address,
+            {"commitment": "confirmed"},
         ],
     }
 
     http_resp = http_request_with_retry(
         cfg=None,
         logger=logger,
-        label="使用原始 RPC 请求获取 USDC 余额",
+        label="使用 getTokenAccountBalance 获取 USDC 余额",
         method="POST",
         url=rpc_url,
         headers={"Content-Type": "application/json"},
@@ -488,25 +650,31 @@ def get_usdc_balance(
         sleep_s=retry_sleep_s,
     )
     data = http_resp.json()
+    
+    # 检查是否有错误（账户不存在时会返回错误）
+    if "error" in data:
+        error_msg = data.get("error", {}).get("message", "未知错误")
+        # 账户不存在通常意味着余额为 0
+        if "could not find" in error_msg.lower() or "not found" in error_msg.lower():
+            logger.debug("USDC ATA 账户不存在，余额为 0: %s", ata_address)
+            return 0
+        logger.warning("查询 USDC 余额返回错误: %s", error_msg)
+        return 0
+    
     result = data.get("result", {})
-    value = result.get("value", [])
-
-    total = 0
-    for item in value:
-        try:
-            # 增加容错处理
-            if isinstance(item, dict):
-                account = item.get("account", {})
-                data_inner = account.get("data", {})
-                if isinstance(data_inner, dict):
-                    parsed = data_inner.get("parsed", {})
-                    info = parsed.get("info", {})
-                    token_amount = info.get("tokenAmount", {})
-                    amount_str = token_amount.get("amount", "0")
-                    total += int(amount_str)
-        except Exception as parse_e:  # noqa: BLE001
-            logger.debug("解析 USDC 余额时跳过异常账户: %s, 错误: %s", item, parse_e)
-    return total
+    value = result.get("value", {})
+    
+    if not value:
+        # ATA 账户可能不存在，返回 0
+        logger.debug("USDC ATA 账户可能不存在，余额为 0")
+        return 0
+    
+    try:
+        amount_str = value.get("amount", "0")
+        return int(amount_str)
+    except Exception as parse_e:  # noqa: BLE001
+        logger.debug("解析 USDC 余额失败: %s, 错误: %s", value, parse_e)
+        return 0
 
 
 
@@ -521,21 +689,28 @@ def get_usdc_balance_with_retry(
 ) -> int:
     """带重试的 USDC 余额查询, 在交易确认后使用. 
     
+    使用 getTokenAccountBalance API 查询 ATA 账户余额.
     在第 1 步交易确认后, RPC 节点可能还未同步最新状态,
     因此需要多次重试以获取正确的 USDC 余额.
     """
     
+    # 计算 ATA 地址（会使用缓存，不会重复计算）
+    try:
+        ata_address = get_ata_address_via_solders(owner_pubkey, usdc_mint)
+    except Exception as e:
+        logger.error("计算 USDC ATA 地址失败: %s", e)
+        raise RuntimeError(f"计算 USDC ATA 地址失败: {e}") from e
+    
     for attempt in range(1, retry_max_attempts + 1):
         try:
-            # 使用原始 JSON-RPC 请求, 显式指定 commitment: "confirmed"
+            # 使用 getTokenAccountBalance 查询余额
             payload = {
                 "jsonrpc": "2.0",
                 "id": 1,
-                "method": "getTokenAccountsByOwner",
+                "method": "getTokenAccountBalance",
                 "params": [
-                    owner_pubkey,
-                    {"mint": usdc_mint},
-                    {"encoding": "jsonParsed", "commitment": "confirmed"},
+                    ata_address,
+                    {"commitment": "confirmed"},
                 ],
             }
             
@@ -547,17 +722,31 @@ def get_usdc_balance_with_retry(
             )
             http_resp.raise_for_status()
             data = http_resp.json()
-            result = data.get("result", {})
-            value = result.get("value", [])
             
-            total = 0
-            for item in value:
-                try:
-                    if isinstance(item, dict):
-                        amount_str = item["account"]["data"]["parsed"]["info"]["tokenAmount"]["amount"]
-                        total += int(amount_str)
-                except Exception:  # noqa: BLE001
-                    pass
+            # 检查是否有错误（账户不存在时会返回错误）
+            if "error" in data:
+                error_msg = data.get("error", {}).get("message", "未知错误")
+                if "could not find" in error_msg.lower() or "not found" in error_msg.lower():
+                    logger.debug("第 %d 次重试: USDC ATA 账户不存在，余额为 0", attempt)
+                    if attempt < retry_max_attempts:
+                        time.sleep(retry_sleep_s)
+                    continue
+                logger.warning("第 %d 次重试: 查询 USDC 余额返回错误: %s", attempt, error_msg)
+                if attempt < retry_max_attempts:
+                    time.sleep(retry_sleep_s)
+                continue
+            
+            result = data.get("result", {})
+            value = result.get("value", {})
+            
+            if not value:
+                logger.debug("第 %d 次重试: USDC 余额返回为空，等待重试...", attempt)
+                if attempt < retry_max_attempts:
+                    time.sleep(retry_sleep_s)
+                continue
+            
+            amount_str = value.get("amount", "0")
+            total = int(amount_str)
             
             if total > 0:
                 logger.debug("第 %d 次重试: 获取 USDC 余额成功: %d", attempt, total)
@@ -591,58 +780,51 @@ def get_sol_balance(
     retry_max_attempts: int = 10,
     retry_sleep_s: int = 2,
 ) -> int:
-    """查询指定钱包当前的 SOL 余额(最小单位 lamports)."""
+    """查询指定钱包当前的 SOL 余额(最小单位 lamports).
+    
+    直接使用原始 JSON-RPC 调用 getBalance API，避免 solana-py 库的兼容性问题。
+    """
 
-    owner_pk = Pubkey.from_string(owner_pubkey)
+    # 如果未显式传入 rpc_url, 则尝试从 client 中获取
+    if rpc_url is None:
+        try:
+            rpc_url = getattr(getattr(client, "_provider", None), "endpoint_uri", None)
+        except Exception:  # noqa: BLE001
+            rpc_url = None
 
-    # 先通过 solana-py 获取 SOL 余额, 如果解析失败则退回到原始 JSON-RPC 调用
-    try:
-        resp_sol = client.get_balance(owner_pk)
+    if not rpc_url:
+        raise RuntimeError("获取 SOL 余额失败: 无法确定 RPC URL")
 
-        # 兼容 typed 响应和 dict 响应
-        if hasattr(resp_sol, "value"):
-            sol_lamports = int(resp_sol.value)
-        else:
-            sol_lamports = int(resp_sol.get("result", {}).get("value", 0))
-    except Exception as e:  # noqa: BLE001
-        # 这一层失败通常是响应结构与当前 solana-py 版本的 typed 定义不完全匹配
-        # 下面会自动退回到原始 JSON-RPC 调用, 因此这里仅记录为 WARNING
-        logger.warning("通过 solana-py 获取 SOL 余额失败, 将退回原始 JSON-RPC 调用: %s", e)
+    # 使用原始 JSON-RPC 调用 getBalance
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getBalance",
+        "params": [owner_pubkey, {"commitment": "confirmed"}],
+    }
 
-        if rpc_url is None:
-            try:
-                rpc_url = getattr(getattr(client, "_provider", None), "endpoint_uri", None)
-            except Exception:  # noqa: BLE001
-                rpc_url = None
-
-        if not rpc_url:
-            # 无法获得 RPC 地址, 只能把异常抛出去
-            raise
-
-        # 使用原始 JSON-RPC 调用作为兜底, 并增加重试机制(使用通用 HTTP 重试封装)
-        payload = {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "getBalance",
-            "params": [owner_pubkey, {"commitment": "confirmed"}],
-        }
-
-        http_resp = http_request_with_retry(
-            cfg=None,
-            logger=logger,
-            label="使用原始 RPC 请求获取 SOL 余额",
-            method="POST",
-            url=rpc_url,
-            headers={"Content-Type": "application/json"},
-            json_body=payload,
-            timeout=20,
-            treat_insufficient_as_fatal=False,
-            max_attempts=retry_max_attempts,
-            sleep_s=retry_sleep_s,
-        )
-        data = http_resp.json()
-        sol_lamports = int(data.get("result", {}).get("value", 0))
-
+    http_resp = http_request_with_retry(
+        cfg=None,
+        logger=logger,
+        label="使用 getBalance 获取 SOL 余额",
+        method="POST",
+        url=rpc_url,
+        headers={"Content-Type": "application/json"},
+        json_body=payload,
+        timeout=20,
+        treat_insufficient_as_fatal=False,
+        max_attempts=retry_max_attempts,
+        sleep_s=retry_sleep_s,
+    )
+    data = http_resp.json()
+    
+    # 检查是否有错误
+    if "error" in data:
+        error_msg = data.get("error", {}).get("message", "未知错误")
+        logger.warning("查询 SOL 余额返回错误: %s", error_msg)
+        return 0
+    
+    sol_lamports = int(data.get("result", {}).get("value", 0))
     return sol_lamports
 
 
@@ -1031,23 +1213,67 @@ def swap_sign_and_send(
     
     logger.debug("交易签名完成")
     
-    # 3. 通过 Solana RPC 发送交易
-    # 使用 skip_preflight=True 跳过预检查，因为预检查时的价格可能已变化导致滑点错误
+    # 3. 通过原始 JSON-RPC 发送交易（避免 solana-py 的超时问题）
+    # 使用 skipPreflight=True 跳过预检查，因为预检查时的价格可能已变化导致滑点错误
     try:
         signed_tx_bytes = bytes(signed_tx)
-        # 跳过 preflight 检查，直接发送到链上
-        # 这可以避免因预检查时价格变化导致的假滑点错误
-        tx_opts = TxOpts(skip_preflight=True, skip_confirmation=True)
-        response = client.send_raw_transaction(signed_tx_bytes, opts=tx_opts)
+        signed_tx_base64 = base64.b64encode(signed_tx_bytes).decode("utf-8")
         
-        # 提取交易签名
-        if hasattr(response, "value"):
-            tx_signature = str(response.value)
-        else:
-            tx_signature = str(response.get("result", ""))
+        # 获取 RPC URL
+        rpc_url = cfg.rpc_url
+        if not rpc_url:
+            try:
+                rpc_url = getattr(getattr(client, "_provider", None), "endpoint_uri", None)
+            except Exception:  # noqa: BLE001
+                pass
+        
+        if not rpc_url:
+            raise RuntimeError("无法确定 RPC URL")
+        
+        # 使用原始 JSON-RPC 调用 sendTransaction
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "sendTransaction",
+            "params": [
+                signed_tx_base64,
+                {
+                    "encoding": "base64",
+                    "skipPreflight": True,
+                    "preflightCommitment": "confirmed",
+                    "maxRetries": 3,
+                },
+            ],
+        }
+        
+        # 使用较长的超时时间（60秒）避免 ReadTimeout
+        http_resp = http_request_with_retry(
+            cfg=cfg,
+            logger=logger,
+            label="发送 Swap 交易",
+            method="POST",
+            url=rpc_url,
+            headers={"Content-Type": "application/json"},
+            json_body=payload,
+            timeout=60,
+            treat_insufficient_as_fatal=False,
+            max_attempts=3,
+            sleep_s=2,
+        )
+        
+        data = http_resp.json()
+        
+        # 检查是否有错误
+        if "error" in data:
+            error_info = data.get("error", {})
+            error_msg = error_info.get("message", "未知错误")
+            error_code = error_info.get("code", "")
+            raise RuntimeError(f"RPC 返回错误: {error_msg} (code={error_code})")
+        
+        tx_signature = data.get("result", "")
         
         if not tx_signature:
-            raise RuntimeError(f"发送交易后未能获取签名: {response}")
+            raise RuntimeError(f"发送交易后未能获取签名: {data}")
         
         logger.info("交易已发送: %s", tx_signature)
         logger.info("Solscan: https://solscan.io/tx/%s", tx_signature)
@@ -1137,8 +1363,6 @@ def _execute_first_leg(
             keypair=keypair,
         )
 
-        logger.info("第 1 步 SOL->USDC 交易已提交, 签名: %s", sig1)
-
         tx_logger.info(
             (
                 "步骤=1 类型=SOL_TO_USDC "
@@ -1165,7 +1389,8 @@ def _execute_first_leg(
     # 这是关键步骤: 必须等第 1 步交易确认后才能执行第 2 步
     confirm_timeout = max(cfg.tx_interval_s, 30)
     logger.info(
-        "第 1 步 SOL->USDC 交易已提交, 开始等待最多 %d 秒以确认链上状态...",
+        "第 1 步 SOL->USDC 交易已提交, 签名: %s, 开始等待最多 %d 秒以确认链上状态...",
+        sig1,
         confirm_timeout,
     )
 
@@ -1367,28 +1592,6 @@ def _execute_second_leg(
             )
             return False, stats, error_reason
 
-        # 记录第二笔交易完成后的钱包余额
-        try:
-            sol_after_leg2, usdc_after_leg2 = get_wallet_balances(
-                client,
-                wallet_pubkey,
-                usdc_mint,
-                logger,
-                cfg.rpc_url,
-                cfg.retry_max_attempts,
-                cfg.retry_sleep_s,
-            )
-
-            tx_logger.info(
-                "余额快照 阶段=第 2 步后 钱包_SOL_lamports=%d 钱包_SOL=%.9f 钱包_USDC_units=%d 钱包_USDC=%.6f",
-                sol_after_leg2,
-                sol_after_leg2 / 1_000_000_000,
-                usdc_after_leg2,
-                usdc_after_leg2 / 1_000_000,
-            )
-        except Exception as e:  # noqa: BLE001
-            logger.warning("获取第 2 步后钱包余额失败: %s", e)
-
     except Exception as e:  # noqa: BLE001
         error_reason = f"第 2 步 USDC->SOL 交易失败: {e}"
         logger.error(error_reason)
@@ -1403,6 +1606,7 @@ def _execute_trade_pair_once(
     keypair: Keypair,
     logger: logging.Logger,
     tx_logger: logging.Logger,
+    rpc_manager: RpcUrlManager,
 ) -> tuple[bool, dict, Optional[str]]:
     """执行"一对交易": SOL -> USDC -> SOL. 
 
@@ -1442,9 +1646,9 @@ def _execute_trade_pair_once(
         )
         return False, base_empty_stats.copy(), error_reason
 
-    # 默认 mainnet RPC
-    rpc_url = cfg.rpc_url
-    logger.info(f'rpc_url: {rpc_url}')
+    # 使用 RPC URL 管理器获取当前 URL
+    rpc_url = rpc_manager.current_url
+    logger.info(f'当前 RPC URL: {rpc_url}')
 
     # 使用全局常量
     sol_mint = SOL_MINT
@@ -1503,12 +1707,16 @@ def _execute_trade_pair_once(
             stats["step1_success_count"] += 1  # 记录成功次数
             break  # 第 1 步成功，跳出重试循环
 
-        # 第 1 步失败
+        # 第 1 步失败，记录当前 RPC URL 的失败次数
         stats["step1_fail_count"] += 1  # 记录失败次数
+        rpc_manager.record_failure()
+        
         # 判断是否需要重试
         if attempt < cfg.retry_max_attempts:
+            # 切换到下一个 RPC URL
+            rpc_manager.switch_to_next()
             logger.warning(
-                "第 1 步 SOL->USDC 交易失败(第 %d/%d 次尝试), %d 秒后重试...",
+                "第 1 步 SOL->USDC 交易失败(第 %d/%d 次尝试), %d 秒后使用新 RPC 重试...",
                 attempt,
                 cfg.retry_max_attempts,
                 cfg.retry_sleep_s,
@@ -1550,12 +1758,16 @@ def _execute_trade_pair_once(
             stats["step2_success_count"] += 1  # 记录成功次数
             break  # 第 2 步成功，跳出重试循环
 
-        # 第 2 步失败
+        # 第 2 步失败，记录当前 RPC URL 的失败次数
         stats["step2_fail_count"] += 1  # 记录失败次数
+        rpc_manager.record_failure()
+        
         # 判断是否需要重试
         if attempt < cfg.retry_max_attempts:
+            # 切换到下一个 RPC URL
+            rpc_manager.switch_to_next()
             logger.warning(
-                "第 2 步 USDC->SOL 交易失败(第 %d/%d 次尝试), %d 秒后重试...",
+                "第 2 步 USDC->SOL 交易失败(第 %d/%d 次尝试), %d 秒后使用新 RPC 重试...",
                 attempt,
                 cfg.retry_max_attempts,
                 cfg.retry_sleep_s,
@@ -1581,6 +1793,7 @@ def execute_trade_pair(
     cfg: AppConfig,
     logger: logging.Logger,
     tx_logger: logging.Logger,
+    rpc_manager: RpcUrlManager,
 ) -> tuple[bool, dict, Optional[str]]:
     """执行"一对交易" (SOL->USDC->SOL). 
 
@@ -1591,7 +1804,7 @@ def execute_trade_pair(
     """
 
     try:
-        return _execute_trade_pair_once(cfg, client, keypair, logger, tx_logger)
+        return _execute_trade_pair_once(cfg, client, keypair, logger, tx_logger, rpc_manager)
 
     except Exception as e:  # noqa: BLE001
         logger.error("执行一对交易时发生未捕获异常: %s", e)
@@ -1626,6 +1839,10 @@ def run_trading_loop(
         cfg.priority_fee,
         cfg.priority_fee / 1_000_000_000,
     )
+    logger.info("配置的 RPC URL 列表(%d 个): %s", len(cfg.rpc_urls), cfg.rpc_urls)
+
+    # 创建 RPC URL 管理器
+    rpc_manager = RpcUrlManager(cfg.rpc_urls, logger)
 
     # 记录开始时间，用于计算总执行时长
     start_time = time.time()
@@ -1671,14 +1888,14 @@ def run_trading_loop(
                 }
                 pair_error = None
             else:
+                logger.info("========== 第 %d 对交易 ==========", success_pairs + 1)
                 logger.info("开始执行第 %d 对交易 (SOL->USDC->SOL)...", success_pairs + 1)
 
-                # 每轮交易开始时记录钱包当前余额
+                # 每轮交易开始时记录钱包当前 SOL 余额（不查询 USDC，减少 RPC 调用）
                 try:
-                    sol_before_pair, usdc_before_pair = get_wallet_balances(
+                    sol_before_pair = get_sol_balance(
                         client,
                         wallet_pubkey,
-                        USDC_MINT,
                         logger,
                         cfg.rpc_url,
                         cfg.retry_max_attempts,
@@ -1686,11 +1903,9 @@ def run_trading_loop(
                     )
 
                     tx_logger.info(
-                        "余额快照 阶段=一对开始 钱包_SOL_lamports=%d 钱包_SOL=%.9f 钱包_USDC_units=%d 钱包_USDC=%.6f",
+                        "余额快照 阶段=一对开始 钱包_SOL_lamports=%d 钱包_SOL=%.9f",
                         sol_before_pair,
                         sol_before_pair / 1_000_000_000,
-                        usdc_before_pair,
-                        usdc_before_pair / 1_000_000,
                     )
 
                     # 只有在成功获取余额的情况下才继续执行一轮交易
@@ -1700,6 +1915,7 @@ def run_trading_loop(
                         cfg,
                         logger,
                         tx_logger,
+                        rpc_manager,
                     )
 
                 except Exception as e:  # noqa: BLE001
@@ -1773,11 +1989,19 @@ def run_trading_loop(
 
         if pair_ok:
             success_pairs += 1
-            logger.info("第 %d 次 %s 执行成功. ", success_pairs, unit_label)
+            logger.info(
+                "第 %d 次 %s 执行成功 (当前进度: %d/%d). ",
+                success_pairs,
+                unit_label,
+                success_pairs,
+                cfg.max_runs,
+            )
         else:
             logger.error(
-                "本次 %s 执行失败, 不计入成功次数. 本轮将继续尝试下一次 %s. ",
+                "本次 %s 执行失败, 不计入成功次数 (当前进度: %d/%d). 本轮将继续尝试下一次 %s. ",
                 unit_label,
+                success_pairs,
+                cfg.max_runs,
                 unit_label,
             )
             # 失败后不终止整个循环, 继续下一轮
@@ -1792,7 +2016,12 @@ def run_trading_loop(
             break
 
         # 间隔一段时间后, 在下一笔交易前休眠一段时间
-        logger.debug("本次一对交易结束, 休眠 %d 秒后继续下一笔交易. ", cfg.tx_interval_s)
+        logger.debug(
+            "本次一对交易结束 (当前进度: %d/%d), 休眠 %d 秒后继续下一笔交易. ",
+            success_pairs,
+            cfg.max_runs,
+            cfg.tx_interval_s,
+        )
         time.sleep(cfg.tx_interval_s)
 
     # 本轮运行结束后的统计输出
@@ -1861,6 +2090,13 @@ def run_trading_loop(
         if last_error_reason:
             logger.error("本轮存在交易失败, 失败原因: %s", last_error_reason)
             tx_logger.info("本轮存在交易失败, 失败原因: %s", last_error_reason)
+        
+        # 输出各 RPC URL 的失败次数统计
+        rpc_fail_stats = rpc_manager.get_fail_stats()
+        if rpc_fail_stats:
+            fail_details = ", ".join([f"{url}: {count}次" for url, count in rpc_fail_stats.items()])
+            logger.info("RPC URL 失败统计: %s", fail_details)
+            tx_logger.info("RPC URL 失败统计: %s", fail_details)
     else:
         logger.info(
             "本轮统计: 当前 enable_trading=false, 未发送任何真实交易. 成功 %s 次数=%d, 统计的 SOL/USDC 数量均为 0. ",
@@ -1886,6 +2122,34 @@ def run_trading_loop(
     
     logger.info("总执行时长: %s (%.2f 秒)", duration_str, total_elapsed_time)
     tx_logger.info("总执行时长: %s (%.2f 秒)", duration_str, total_elapsed_time)
+
+    # 整轮执行结束后，查询并打印钱包最终余额
+    try:
+        final_sol, final_usdc = get_wallet_balances(
+            client,
+            wallet_pubkey,
+            USDC_MINT,
+            logger,
+            cfg.rpc_url,
+            cfg.retry_max_attempts,
+            cfg.retry_sleep_s,
+        )
+        logger.info(
+            "整轮结束后钱包余额: SOL=%.9f (%d lamports), USDC=%.6f (%d 最小单位)",
+            final_sol / 1_000_000_000,
+            final_sol,
+            final_usdc / 1_000_000,
+            final_usdc,
+        )
+        tx_logger.info(
+            "整轮结束后钱包余额: SOL=%.9f (%d lamports), USDC=%.6f (%d 最小单位)",
+            final_sol / 1_000_000_000,
+            final_sol,
+            final_usdc / 1_000_000,
+            final_usdc,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning("查询整轮结束后钱包余额失败: %s", e)
 
 
 def run_auto_trader() -> None:
