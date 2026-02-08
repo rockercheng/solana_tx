@@ -1627,6 +1627,9 @@ def run_trading_loop(
         cfg.priority_fee / 1_000_000_000,
     )
 
+    # 记录开始时间，用于计算总执行时长
+    start_time = time.time()
+
     success_pairs = 0
     unit_label = "一对交易"
 
@@ -1869,6 +1872,20 @@ def run_trading_loop(
             unit_label,
             success_pairs,
         )
+
+    # 计算并输出总执行时长
+    total_elapsed_time = time.time() - start_time
+    hours, remainder = divmod(int(total_elapsed_time), 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours > 0:
+        duration_str = f"{hours}小时{minutes}分{seconds}秒"
+    elif minutes > 0:
+        duration_str = f"{minutes}分{seconds}秒"
+    else:
+        duration_str = f"{seconds}秒"
+    
+    logger.info("总执行时长: %s (%.2f 秒)", duration_str, total_elapsed_time)
+    tx_logger.info("总执行时长: %s (%.2f 秒)", duration_str, total_elapsed_time)
 
 
 def run_auto_trader() -> None:
