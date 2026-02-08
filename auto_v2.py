@@ -1411,8 +1411,8 @@ def _execute_first_leg(
     logger.info("第 1 步 SOL->USDC 交易已在链上确认成功!")
 
     # 在执行第 2 步前, 短暂等待让 RPC 节点同步数据
-    logger.debug("等待 2 秒让 RPC 节点同步数据...")
-    time.sleep(2)
+    logger.debug("等待 1 秒让 RPC 节点同步数据...")
+    time.sleep(1)
 
     # 查询当前 USDC 余额, 使用带重试的函数
     try:
