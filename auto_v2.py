@@ -749,7 +749,6 @@ def get_usdc_balance_with_retry(
             total = int(amount_str)
             
             if total > 0:
-                logger.debug("第 %d 次重试: 获取 USDC 余额成功: %d", attempt, total)
                 return total
             
             # 如果余额为 0, 可能是数据未同步, 继续重试
@@ -1013,14 +1012,6 @@ def swap_get_quote(
     if out_amount <= 0:
         raise RuntimeError(f"询价 返回的 outAmount 无效: {quote_response.get('outAmount')}")
     
-    logger.info(
-        "询价 成功: 输入=%d, 预计输出=%d, 有效滑点=%d bps (配置=%d bps)",
-        amount,
-        out_amount,
-        effective_slippage,
-        cfg.slippage_bps,
-    )
-    
     return quote_response
 
 
@@ -1030,7 +1021,7 @@ def swap_build_transaction(
     http_session: requests.Session,
     user_pubkey: str,
     quote_response: dict,
-) -> tuple[str, int]:
+) -> tuple[str, int, int]:
     """调用 Jupiter Swap API 的 /swap 接口构造交易. 
     
     参数:
@@ -1038,7 +1029,7 @@ def swap_build_transaction(
         quote_response: /quote 返回的询价对象
         
     返回:
-        (swap_transaction_base64, last_valid_block_height)
+        (swap_transaction_base64, last_valid_block_height, actual_priority_fee)
     """
     
     swap_url = f"{JUPITER_SWAP_API_BASE}/swap"
@@ -1060,11 +1051,7 @@ def swap_build_transaction(
         # 滑点由 quoteResponse 中的 slippageBps 控制
     }
     
-    logger.debug(
-        "请求 Swap 交易构造: priorityFee=%d lamports, slippage=%d bps",
-        cfg.priority_fee,
-        cfg.slippage_bps,
-    )
+    # logger.debug("请求 Swap 交易构造...")
     
     resp = http_request_with_retry(
         cfg=cfg,
@@ -1098,13 +1085,7 @@ def swap_build_transaction(
     last_valid_block_height = swap_response.get("lastValidBlockHeight", 0)
     actual_priority_fee = swap_response.get("prioritizationFeeLamports", cfg.priority_fee)
     
-    logger.info(
-        "Swap 交易构造成功: 实际优先费=%d lamports, lastValidBlockHeight=%d",
-        actual_priority_fee,
-        last_valid_block_height,
-    )
-    
-    return swap_tx_base64, last_valid_block_height
+    return swap_tx_base64, last_valid_block_height, actual_priority_fee
 
 
 def _extract_solana_error_details(e: Exception, logger: logging.Logger) -> str:
@@ -1211,7 +1192,7 @@ def swap_sign_and_send(
         logger.error("签名 Swap 交易失败: %s", e)
         raise RuntimeError(f"签名 Swap 交易失败: {e}") from e
     
-    logger.debug("交易签名完成")
+    # logger.debug("交易签名完成")
     
     # 3. 通过原始 JSON-RPC 发送交易（避免 solana-py 的超时问题）
     # 使用 skipPreflight=True 跳过预检查，因为预检查时的价格可能已变化导致滑点错误
@@ -1275,9 +1256,6 @@ def swap_sign_and_send(
         if not tx_signature:
             raise RuntimeError(f"发送交易后未能获取签名: {data}")
         
-        logger.info("交易已发送: %s", tx_signature)
-        logger.info("Solscan: https://solscan.io/tx/%s", tx_signature)
-        
         return tx_signature
     except Exception as e:
         # 提取详细错误信息
@@ -1337,21 +1315,21 @@ def _execute_first_leg(
         stats["usdc_received_units"] = out_usdc_amount
         stats["usdc_spent_units"] = out_usdc_amount
 
-        logger.info(
-            "SOL->USDC 询价成功: 输入=%d lamports (%.9f SOL), 预计输出=%d USDC units (%.6f USDC)",
-            amount_sol_lamports,
-            amount_sol_lamports / 1_000_000_000,
-            out_usdc_amount,
-            out_usdc_amount / 1_000_000,
-        )
-
         # 2. 构造交易
-        swap_tx_base64, _ = swap_build_transaction(
+        swap_tx_base64, _, actual_priority_fee = swap_build_transaction(
             cfg=cfg,
             logger=logger,
             http_session=http_session,
             user_pubkey=wallet_pubkey,
             quote_response=quote_response,
+        )
+
+        logger.info(
+            "SOL->USDC 询价成功: %.9f SOL -> %.6f USDC, 滑点=%d bps, 优先费=%d lamports",
+            amount_sol_lamports / 1_000_000_000,
+            out_usdc_amount / 1_000_000,
+            cfg.slippage_bps,
+            actual_priority_fee,
         )
 
         # 3. 签名并发送交易
@@ -1389,9 +1367,9 @@ def _execute_first_leg(
     # 这是关键步骤: 必须等第 1 步交易确认后才能执行第 2 步
     confirm_timeout = max(cfg.tx_interval_s, 30)
     logger.info(
-        "第 1 步 SOL->USDC 交易已提交, 签名: %s, 开始等待最多 %d 秒以确认链上状态...",
-        sig1,
+        "第 1 步 SOL->USDC 交易已提交, 等待确认(最多 %d 秒)... Solscan: https://solscan.io/tx/%s",
         confirm_timeout,
+        sig1,
     )
 
     if not wait_for_transaction_confirmation(
@@ -1426,8 +1404,6 @@ def _execute_first_leg(
             retry_sleep_s=2,
         )
 
-        logger.info("当前 USDC 余额(最小单位) = %d (%.6f USDC)", current_usdc_balance, current_usdc_balance / 1_000_000)
-        
         if current_usdc_balance <= 0:
             error_reason = f"当前 USDC 余额({current_usdc_balance}) 小于等于 0, 无法执行 USDC->SOL 交易. "
             logger.error(error_reason)
@@ -1487,8 +1463,7 @@ def _execute_second_leg(
 
     # -------- 第 2 步: USDC -> SOL --------
     logger.info(
-        "第 2 步: 准备将 %d USDC units (%.6f USDC) 换回 SOL...",
-        effective_usdc_amount,
+        "第 2 步: 获取 USDC 余额成功, 准备将 %.6f USDC 换回 SOL...",
         effective_usdc_amount / 1_000_000,
     )
 
@@ -1509,21 +1484,21 @@ def _execute_second_leg(
             logger.error("%s, 完整响应: %s", error_reason, quote_response)
             return False, stats, error_reason
 
-        logger.info(
-            "USDC->SOL 询价成功: 输入=%d USDC units (%.6f USDC), 预计输出=%d lamports (%.9f SOL)",
-            effective_usdc_amount,
-            effective_usdc_amount / 1_000_000,
-            out_sol_lamports,
-            out_sol_lamports / 1_000_000_000,
-        )
-
         # 2. 构造交易
-        swap_tx_base64, _ = swap_build_transaction(
+        swap_tx_base64, _, actual_priority_fee = swap_build_transaction(
             cfg=cfg,
             logger=logger,
             http_session=http_session,
             user_pubkey=wallet_pubkey,
             quote_response=quote_response,
+        )
+
+        logger.info(
+            "USDC->SOL 询价成功: %.6f USDC -> %.9f SOL, 滑点=%d bps, 优先费=%d lamports",
+            effective_usdc_amount / 1_000_000,
+            out_sol_lamports / 1_000_000_000,
+            cfg.slippage_bps,
+            actual_priority_fee,
         )
 
         # 3. 签名并发送交易
@@ -1537,8 +1512,6 @@ def _execute_second_leg(
 
         # 第 2 步成功后, 记录最终买回的 SOL 数量
         stats["sol_bought_lamports"] = out_sol_lamports
-
-        logger.info("第 2 步完成, 交易签名: %s", sig2)
         
         tx_logger.info(
             (
@@ -1571,8 +1544,9 @@ def _execute_second_leg(
         # 等待第 2 步交易确认 (必须等待确认成功才算交易完成)
         confirm_timeout = max(cfg.tx_interval_s, 20)
         logger.info(
-            "第 2 步 USDC->SOL 交易已提交, 开始等待最多 %d 秒以确认链上状态...",
+            "第 2 步交易已提交, 等待确认(最多 %d 秒)... 签名: %s",
             confirm_timeout,
+            sig2,
         )
 
         if not wait_for_transaction_confirmation(
@@ -1608,14 +1582,14 @@ def _execute_trade_pair_once(
     tx_logger: logging.Logger,
     rpc_manager: RpcUrlManager,
 ) -> tuple[bool, dict, Optional[str]]:
-    """执行"一对交易": SOL -> USDC -> SOL. 
+    """执行"交易对": SOL -> USDC -> SOL. 
 
     步骤:
     1. 使用配置中的 trade_amount (SOL 数量) 将 SOL 换成 USDC;
     2. 等待第 1 步交易在链上确认;
     3. 使用步骤 1 得到的 USDC 金额再换回 SOL. 
 
-    任一步骤失败, 都会立即终止本次"一对交易", 并返回 (False, stats). 
+    任一步骤失败, 都会立即终止本次"交易对", 并返回 (False, stats). 
     全部成功时返回 (True, stats). 
     """
 
@@ -1724,7 +1698,7 @@ def _execute_trade_pair_once(
             time.sleep(cfg.retry_sleep_s)
         else:
             logger.error(
-                "第 1 步 SOL->USDC 交易失败(已尝试 %d 次), 放弃本次一对交易",
+                "第 1 步 SOL->USDC 交易失败(已尝试 %d 次), 放弃本次交易对",
                 cfg.retry_max_attempts,
             )
 
@@ -1775,7 +1749,7 @@ def _execute_trade_pair_once(
             time.sleep(cfg.retry_sleep_s)
         else:
             logger.error(
-                "第 2 步 USDC->SOL 交易失败(已尝试 %d 次), 放弃本次一对交易",
+                "第 2 步 USDC->SOL 交易失败(已尝试 %d 次), 放弃本次交易对",
                 cfg.retry_max_attempts,
             )
 
@@ -1783,7 +1757,6 @@ def _execute_trade_pair_once(
         return False, stats, error_reason
 
     # 两步都成功
-    logger.info("一对交易全部完成！")
     return True, stats, None
 
 
@@ -1795,10 +1768,10 @@ def execute_trade_pair(
     tx_logger: logging.Logger,
     rpc_manager: RpcUrlManager,
 ) -> tuple[bool, dict, Optional[str]]:
-    """执行"一对交易" (SOL->USDC->SOL). 
+    """执行"交易对" (SOL->USDC->SOL). 
 
     返回 (success, stats, error_reason):
-    - success: 是否成功完成一对交易
+    - success: 是否成功完成交易对
     - stats: 参见 _execute_trade_pair_once 的返回说明
     - error_reason: 如果失败, 为本次失败的一句简要原因描述; 成功时为 None
     """
@@ -1807,13 +1780,13 @@ def execute_trade_pair(
         return _execute_trade_pair_once(cfg, client, keypair, logger, tx_logger, rpc_manager)
 
     except Exception as e:  # noqa: BLE001
-        logger.error("执行一对交易时发生未捕获异常: %s", e)
+        logger.error("执行交易对时发生未捕获异常: %s", e)
         return False, {
             "sol_spent_lamports": 0,
             "usdc_received_units": 0,
             "usdc_spent_units": 0,
             "sol_bought_lamports": 0,
-        }, f"执行一对交易时发生未捕获异常: {e}"
+        }, f"执行交易对时发生未捕获异常: {e}"
 
 
 def run_trading_loop(
@@ -1826,11 +1799,11 @@ def run_trading_loop(
 ) -> None:
     """自动交易循环. 
     
-    每轮执行一对交易 (SOL->USDC->SOL)
+    每轮执行交易对 (SOL->USDC->SOL)
     """
 
     logger.info(
-        '开始进入自动交易循环, 每一轮都会执行"一对交易" (SOL->USDC->SOL), 按 Ctrl + C 可手动停止程序. '
+        '开始进入自动交易循环, 每一轮都会执行"交易对" (SOL->USDC->SOL), 按 Ctrl + C 可手动停止程序. '
     )
     logger.info(
         "配置: slippage_bps=%d (%.2f%%), priority_fee=%d lamports (%.9f SOL)",
@@ -1848,7 +1821,7 @@ def run_trading_loop(
     start_time = time.time()
 
     success_pairs = 0
-    unit_label = "一对交易"
+    unit_label = "交易对"
 
     # 记录本轮中最后一次失败的交易的原因(如有)
     last_error_reason: Optional[str] = None
@@ -1870,7 +1843,7 @@ def run_trading_loop(
         try:
             if not cfg.enable_trading:
                 logger.info(
-                    "当前配置已关闭真实交易(enable_trading=false), 本轮仅做心跳检查, 视为一对交易成功. "
+                    "当前配置已关闭真实交易(enable_trading=false), 本轮仅做心跳检查, 视为交易对成功. "
                 )
 
                 pair_ok = True
@@ -1888,8 +1861,8 @@ def run_trading_loop(
                 }
                 pair_error = None
             else:
-                logger.info("========== 第 %d 对交易 ==========", success_pairs + 1)
-                logger.info("开始执行第 %d 对交易 (SOL->USDC->SOL)...", success_pairs + 1)
+                logger.info("\n============================== 第 %d 对交易 ==============================", success_pairs + 1)
+                # logger.info("开始执行第 %d 对交易 (SOL->USDC->SOL)...", success_pairs + 1)
 
                 # 每轮交易开始时记录钱包当前 SOL 余额（不查询 USDC，减少 RPC 调用）
                 try:
@@ -1919,7 +1892,7 @@ def run_trading_loop(
                     )
 
                 except Exception as e:  # noqa: BLE001
-                    logger.error("获取一对交易开始前钱包余额失败: %s", e)
+                    logger.error("获取交易对开始前钱包余额失败: %s", e)
                     pair_ok = False
                     pair_stats = {
                         "sol_spent_lamports": 0,
@@ -1933,7 +1906,7 @@ def run_trading_loop(
                         "step2_success_count": 0,
                         "step2_fail_count": 0,
                     }
-                    pair_error = f"获取一对交易开始前钱包余额失败: {e}"
+                    pair_error = f"获取交易对开始前钱包余额失败: {e}"
 
             # 无论一对交易成功与否，都累加交易步骤统计
             total_step1_exec_count += int(pair_stats.get("step1_exec_count", 0))
@@ -1989,13 +1962,6 @@ def run_trading_loop(
 
         if pair_ok:
             success_pairs += 1
-            logger.info(
-                "第 %d 次 %s 执行成功 (当前进度: %d/%d). ",
-                success_pairs,
-                unit_label,
-                success_pairs,
-                cfg.max_runs,
-            )
         else:
             logger.error(
                 "本次 %s 执行失败, 不计入成功次数 (当前进度: %d/%d). 本轮将继续尝试下一次 %s. ",
@@ -2009,15 +1975,18 @@ def run_trading_loop(
 
         if success_pairs >= cfg.max_runs:
             logger.info(
-                "已完成配置要求的 %s 成功次数 max_runs=%d, 程序将退出. ",
+                "第 %d 次 %s 执行成功, 已完成配置要求的成功次数 max_runs=%d, 程序将退出.",
+                success_pairs,
                 unit_label,
                 cfg.max_runs,
             )
             break
 
         # 间隔一段时间后, 在下一笔交易前休眠一段时间
-        logger.debug(
-            "本次一对交易结束 (当前进度: %d/%d), 休眠 %d 秒后继续下一笔交易. ",
+        logger.info(
+            "第 %d 次 %s 执行成功 (进度: %d/%d), 休眠 %d 秒后继续...",
+            success_pairs,
+            unit_label,
             success_pairs,
             cfg.max_runs,
             cfg.tx_interval_s,
