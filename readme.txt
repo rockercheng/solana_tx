@@ -48,6 +48,12 @@ Solana 自动交易程序 使用说明（面向最终用户）
      - 不要把 config.json 上传到网络或公共仓库。
      - 建议只使用单独的小额钱包，用于测试和自动交易，不要使用主资金钱包。
 
+3. rpc_url
+   - 说明：Solana RPC 服务器地址。
+   - 默认值：rpc_url = "https://solana-rpc.publicnode.com"
+   - 备用: "https://api.mainnet-beta.solana.com"
+      "https://solana-mainnet.core.chainstack.com/d644d2fa944eb114a6c79756734b3ff5"
+
 4. trade_amount_min / trade_amount_max
    - 说明：每一笔 SOL->USDC 交易卖出的 SOL 数量范围。
    - 单位：SOL。
