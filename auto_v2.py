@@ -84,6 +84,8 @@ class AppConfig:
     retry_sleep_s: int  # 交易重试间隔秒数
     slippage_bps: int  # Swap API 使用的滑点(单位: bps, 50 = 0.5%)
     priority_fee: int  # Swap API 使用的优先费(单位: lamports)
+    confirm_timeout_s: int  # 交易确认超时时间(秒), 默认 60
+    confirm_rpc_urls: list  # 确认交易时使用的备用 RPC URL 列表
 
 
 def _backup_log_file_if_exists(log_path: str) -> Optional[str]:
@@ -264,6 +266,15 @@ def load_config(path: str) -> AppConfig:
     # priority_fee: 优先费 (单位: lamports, 10000 = 0.00001 SOL)
     priority_fee = int(raw.get("priority_fee", 10000))
 
+    # 交易确认超时时间(秒), 默认 60 秒
+    confirm_timeout_s = int(raw.get("confirm_timeout_s", 60))
+
+    # 确认交易时使用的备用 RPC URL 列表
+    # 在等待交易确认时, 会轮流使用主 RPC 和备用 RPC 查询, 提高确认成功率
+    confirm_rpc_urls = raw.get("confirm_rpc_urls", [])
+    if not isinstance(confirm_rpc_urls, list):
+        confirm_rpc_urls = []
+
     cfg = AppConfig(
         network=network,
         rpc_url=rpc_url,
@@ -279,6 +290,8 @@ def load_config(path: str) -> AppConfig:
         retry_sleep_s=retry_sleep_s,
         slippage_bps=slippage_bps,
         priority_fee=priority_fee,
+        confirm_timeout_s=confirm_timeout_s,
+        confirm_rpc_urls=confirm_rpc_urls,
     )
     return cfg
 
@@ -674,6 +687,30 @@ def get_wallet_balances(
 
 
 
+def _query_signature_status_from_rpc(
+    rpc_url: str,
+    signature: str,
+    logger: logging.Logger,
+) -> Optional[dict]:
+    """从指定 RPC URL 查询交易签名状态, 返回 status dict 或 None."""
+    try:
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getSignatureStatuses",
+            "params": [[signature], {"searchTransactionHistory": True}],
+        }
+        http_resp = requests.post(rpc_url, json=payload, timeout=20)
+        http_resp.raise_for_status()
+        data = http_resp.json()
+        value_list = data.get("result", {}).get("value", [])
+        status = value_list[0] if value_list else None
+        return status
+    except Exception as e:  # noqa: BLE001
+        logger.debug("从 RPC %s 查询交易状态失败: %s", rpc_url, e)
+        return None
+
+
 def wait_for_transaction_confirmation(
     client: Client,
     signature: str,
@@ -681,9 +718,13 @@ def wait_for_transaction_confirmation(
     rpc_url: Optional[str] = None,
     timeout_s: int = 60,
     poll_interval_s: int = 2,
+    extra_rpc_urls: Optional[list] = None,
 ) -> bool:
     """轮询指定交易签名的确认状态, 在给定超时时间内等待其达到 confirmed/finalized. 
     返回 True 表示交易确认成功, False 表示超时或确认失败. 
+    
+    改进: 支持多 RPC 节点轮询. 当主 RPC 返回 None 时, 会依次尝试 extra_rpc_urls 中的备用 RPC,
+    任一节点确认即视为成功, 大幅提高确认成功率.
     """
 
     # 优先使用 cfg.rpc_url 传入的地址, 否则尝试从 client 中获取
@@ -693,65 +734,76 @@ def wait_for_transaction_confirmation(
         except Exception:  # noqa: BLE001
             rpc_url = None
 
+    # 构建要轮询的 RPC URL 列表 (主 RPC + 备用 RPC, 去重)
+    all_rpc_urls: list[str] = []
+    if rpc_url:
+        all_rpc_urls.append(rpc_url)
+    if extra_rpc_urls:
+        for url in extra_rpc_urls:
+            if url and url not in all_rpc_urls:
+                all_rpc_urls.append(url)
+
+    if len(all_rpc_urls) > 1:
+        logger.info(
+            "交易确认将使用 %d 个 RPC 节点轮询: %s",
+            len(all_rpc_urls),
+            ", ".join(all_rpc_urls),
+        )
+
     deadline = time.time() + timeout_s
     last_status: Optional[dict] = None
 
     while time.time() < deadline:
-        try:
-            status = None
+        status = None
+        used_rpc = None
 
-            # 优先走原始 JSON-RPC, 避免 typed 响应兼容性问题
-            if rpc_url:
-                payload = {
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "getSignatureStatuses",
-                    "params": [[signature], {"searchTransactionHistory": True}],
-                }
-                http_resp = requests.post(rpc_url, json=payload, timeout=20)
-                http_resp.raise_for_status()
-                data = http_resp.json()
-                value_list = data.get("result", {}).get("value", [])
-                status = value_list[0] if value_list else None
-            else:
-                # 兜底使用 solana-py 的客户端
+        if all_rpc_urls:
+            # 依次查询每个 RPC, 直到找到非 None 状态
+            for url in all_rpc_urls:
+                status = _query_signature_status_from_rpc(url, signature, logger)
+                if status is not None:
+                    used_rpc = url
+                    break
+        else:
+            # 兜底使用 solana-py 的客户端
+            try:
                 resp = client.get_signature_statuses([signature])
                 if hasattr(resp, "value"):
                     value_list = resp.value
                 else:
                     value_list = resp.get("result", {}).get("value", [])
                 status = value_list[0] if value_list else None
+            except Exception as e:  # noqa: BLE001
+                logger.warning("查询交易 %s 确认状态时发生异常: %s", signature, e)
 
-            if status is None:
-                logger.debug("交易 %s 尚未出现在节点状态中, 继续等待...", signature)
-            else:
-                # status 可能是 dict, 也可能是 typed 对象, 这里统一转成 dict 访问
-                if not isinstance(status, dict):
-                    # 尝试通过属性构造一个简单的 dict 视图
-                    status = {
-                        "err": getattr(status, "err", None),
-                        "confirmationStatus": getattr(status, "confirmation_status", None),
-                    }
+        if status is None:
+            logger.debug("交易 %s 尚未出现在节点状态中, 继续等待...", signature)
+        else:
+            # status 可能是 dict, 也可能是 typed 对象, 这里统一转成 dict 访问
+            if not isinstance(status, dict):
+                status = {
+                    "err": getattr(status, "err", None),
+                    "confirmationStatus": getattr(status, "confirmation_status", None),
+                }
 
-                last_status = status
-                err = status.get("err")
-                conf_status = status.get("confirmationStatus") or status.get("confirmation_status")
+            last_status = status
+            err = status.get("err")
+            conf_status = status.get("confirmationStatus") or status.get("confirmation_status")
 
-                if err:
-                    logger.error("交易 %s 在链上确认失败: %s", signature, err)
-                    return False
+            if err:
+                logger.error("交易 %s 在链上确认失败: %s", signature, err)
+                return False
 
-                if conf_status in ("confirmed", "finalized"):
-                    logger.info("交易 %s 已在链上确认, 当前状态=%s", signature, conf_status)
-                    return True
+            if conf_status in ("confirmed", "finalized"):
+                rpc_info = f" (via {used_rpc})" if used_rpc and used_rpc != rpc_url else ""
+                logger.info("交易 %s 已在链上确认, 当前状态=%s%s", signature, conf_status, rpc_info)
+                return True
 
-                logger.debug(
-                    "交易 %s 当前确认状态=%s, 继续等待...",
-                    signature,
-                    conf_status,
-                )
-        except Exception as e:  # noqa: BLE001
-            logger.warning("查询交易 %s 确认状态时发生异常: %s", signature, e)
+            logger.debug(
+                "交易 %s 当前确认状态=%s, 继续等待...",
+                signature,
+                conf_status,
+            )
 
         time.sleep(poll_interval_s)
 
@@ -1163,10 +1215,11 @@ def _execute_first_leg(
 
     # -------- 等待第 1 步交易链上确认 --------
     # 这是关键步骤: 必须等第 1 步交易确认后才能执行第 2 步
-    confirm_timeout = max(cfg.tx_interval_s, 30)
+    confirm_timeout = cfg.confirm_timeout_s
     logger.info(
-        "第 1 步 SOL->USDC 交易已提交, 开始等待最多 %d 秒以确认链上状态...",
+        "第 1 步 SOL->USDC 交易已提交, 等待确认(最多 %d 秒)... Solscan: https://solscan.io/tx/%s",
         confirm_timeout,
+        sig1,
     )
 
     if not wait_for_transaction_confirmation(
@@ -1176,6 +1229,7 @@ def _execute_first_leg(
         rpc_url=cfg.rpc_url,
         timeout_s=confirm_timeout,
         poll_interval_s=2,
+        extra_rpc_urls=cfg.confirm_rpc_urls,
     ):
         error_reason = (
             f"SOL->USDC 交易 {sig1} 在 {confirm_timeout} 秒内未确认或确认失败, 无法执行后续 USDC->SOL 交易. "
@@ -1344,10 +1398,11 @@ def _execute_second_leg(
         )
 
         # 等待第 2 步交易确认 (必须等待确认成功才算交易完成)
-        confirm_timeout = max(cfg.tx_interval_s, 20)
+        confirm_timeout = cfg.confirm_timeout_s
         logger.info(
-            "第 2 步 USDC->SOL 交易已提交, 开始等待最多 %d 秒以确认链上状态...",
+            "第 2 步 USDC->SOL 交易已提交, 等待确认(最多 %d 秒)... Solscan: https://solscan.io/tx/%s",
             confirm_timeout,
+            sig2,
         )
 
         if not wait_for_transaction_confirmation(
@@ -1357,6 +1412,7 @@ def _execute_second_leg(
             rpc_url=cfg.rpc_url,
             timeout_s=confirm_timeout,
             poll_interval_s=2,
+            extra_rpc_urls=cfg.confirm_rpc_urls,
         ):
             # 第 2 步确认失败, 需要重试
             error_reason = f"USDC->SOL 交易 {sig2} 链上确认失败或超时"
@@ -1904,6 +1960,11 @@ def run_auto_trader() -> None:
         cfg.slippage_bps / 100,
         cfg.priority_fee,
         cfg.priority_fee / 1_000_000_000,
+    )
+    logger.info(
+        "确认配置: confirm_timeout_s=%d, confirm_rpc_urls=%s",
+        cfg.confirm_timeout_s,
+        cfg.confirm_rpc_urls if cfg.confirm_rpc_urls else "(无备用, 仅使用主 RPC)",
     )
 
     # 2. 初始化私钥

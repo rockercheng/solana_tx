@@ -1,0 +1,26 @@
+{
+  "network": "mainnet",
+  "rpc_urls": [
+    "https://solana-mainnet.core.chainstack.com/d644d2fa944eb114a6c79756734b3ff5",
+    "https://api.mainnet-beta.solana.com",
+    "https://solana-rpc.publicnode.com"
+  ],
+  "private_key": "",
+  "trade_amount_min": 0.02,
+  "trade_amount_max": 0.07,
+  "tx_interval_s": 5,
+  "enable_trading": true,
+  "max_runs": 100,
+
+  "retry_max_attempts": 5,
+  "retry_sleep_s": 1,
+
+  "slippage_bps": 20,
+  "priority_fee": 10000,
+
+  "confirm_timeout_s": 90,
+  "confirm_rpc_urls": [
+    "https://api.mainnet-beta.solana.com",
+    "https://rpc.ankr.com/solana"
+  ]
+}
